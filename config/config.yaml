@@ -1,0 +1,40 @@
+# DJI Mini 4 Pro Hyperlapse Fire Mapping Configuration
+
+drone:
+  model: "DJI Mini 4 Pro"
+  max_altitude_m: 2500        # Regulatory limit
+  survey_altitude_m: 50       # Recommended for fire mapping
+  gimbal_pitch: -90           # Point straight down (nadir)
+  
+hyperlapse:
+  enabled: true
+  interval_seconds: 3         # Frame interval (2-5 recommended)
+  target_resolution: "4K"     # 4096x2160
+
+# Not applicable - Mini 4 Pro doesn't support onboard SDK
+# flight_speed_mps: 5
+# battery_threshold: 20
+# real_time_processing: false
+
+detection:
+  algorithm: "yolov8"  # Future: fire detection model
+  model_path: "models/fire_detector.pt"  # Not yet implemented
+  confidence_threshold: 0.75
+  detection_enabled: false  # TODO: Implement fire detection
+
+telemetry:
+  extract_gps: true
+  extract_gimbal: true
+  extract_timestamp: true
+  
+visualization:
+  create_trajectory_map: true
+  create_altitude_profile: true
+  minimap_zoom: 16
+  
+paths:
+  raw_data: "data/raw"
+  processed_data: "data/processed"
+  outputs: "data/outputs"
+  models: "models"
+
