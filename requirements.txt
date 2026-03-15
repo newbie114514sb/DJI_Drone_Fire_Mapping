@@ -5,6 +5,7 @@ numpy>=1.24.0
 # Image processing & metadata extraction
 Pillow>=10.0.0
 piexif>=1.1.3
+defusedxml>=0.7.1
 
 # Data handling
 pandas>=2.0.0

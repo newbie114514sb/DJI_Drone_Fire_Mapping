@@ -116,7 +116,7 @@ DJI_Drone_Fire_Mapping/
 │   │   └── detector.py               # Fire detection (future)
 │   └── visualization/
 │       ├── telemetry.py              # EXIF extraction
-│       ├── viewer.py                 # Image viewer + telemetry
+│       ├── viewer.py                 # Video viewer, telemetry overlay, and served HUD report
 │       └── map_generator.py          # Map generation
 │
 ├── main.py                           # CLI entry point

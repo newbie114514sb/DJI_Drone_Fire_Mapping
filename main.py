@@ -23,8 +23,8 @@ from datetime import datetime
 
 # Import modules from src
 from src.drone_control.flight_manager import HyperlapseFlightGuide
-from src.visualization.telemetry import TelemetrySequence, ExifTelemetryExtractor
-from src.visualization.viewer import HyperlapseViewer, TrajectoryMapGenerator
+from src.visualization.telemetry import TelemetrySequence
+from src.visualization.viewer import TrajectoryMapGenerator
 
 # Configure logging
 logging.basicConfig(
@@ -38,7 +38,17 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-class HyperlapseFiringMappingSystem:
+class NoCacheHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
+    """Static file handler that disables browser caching for generated reports."""
+
+    def end_headers(self):
+        self.send_header('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0')
+        self.send_header('Pragma', 'no-cache')
+        self.send_header('Expires', '0')
+        super().end_headers()
+
+
+class HyperlapseFireMappingSystem:
     """Main system for analyzing hyperlapse fire mapping flights"""
     
     def __init__(self, config_path: str = 'config/config.yaml'):
@@ -126,8 +136,6 @@ class HyperlapseFiringMappingSystem:
     def get_flight_instructions(self):
         """Get instructions for performing hyperlapse flights"""
         return HyperlapseFlightGuide.get_setup_instructions()
-        viewer.run()
-        return True
     
     @staticmethod
     def _generate_report(telem_seq: TelemetrySequence, output_dir: str):
@@ -157,10 +165,14 @@ class HyperlapseFiringMappingSystem:
             f.write("-" * 50 + "\n")
             for i, telem in enumerate(telem_seq.telemetry[:10]):
                 gps = telem.get('gps', {})
+                gimbal = telem.get('gimbal', {})
                 if gps:
-                    f.write(f"  Image {i}: Lat {gps.get('latitude', 0):.6f}, "
-                           f"Lon {gps.get('longitude', 0):.6f}, "
-                           f"Alt {gps.get('altitude', 0):.1f}m\n")
+                    line = f"  Image {i}: Lat {gps.get('latitude', 0):.6f}, "
+                    line += f"Lon {gps.get('longitude', 0):.6f}, "
+                    line += f"Alt {gps.get('altitude', 0):.1f}m"
+                    if gimbal:
+                        line += f", Gimbal P:{gimbal.get('pitch', 0):.1f}° R:{gimbal.get('roll', 0):.1f}° Y:{gimbal.get('yaw', 0):.1f}°"
+                    f.write(line + "\n")
         
         logger.info(f"Report saved to {report_path}")
 
@@ -204,13 +216,30 @@ def main():
     )
     parser.add_argument(
         '--serve',
+        type=str,
+        nargs='?',
+        const='newest',
+        help='Start a local web server to serve the generated HTML viewer. Optionally specify a report folder name to serve a specific report, or use "newest" to serve the most recent.'
+    )
+    
+    parser.add_argument(
+        '--serve-latest',
         action='store_true',
-        help='Start a local web server to serve the generated HTML viewer'
+        help='Serve the most recently generated report folder (auto-select newest)'
+    )
+    
+    parser.add_argument(
+        '--list-reports',
+        action='store_true',
+        help='List available reports and prompt to choose which one to serve'
     )
     
     args = parser.parse_args()
+
+    if args.serve_latest:
+        args.serve = 'newest'
     
-    system = HyperlapseFiringMappingSystem(args.config)
+    system = HyperlapseFireMappingSystem(args.config)
     
     if args.help_flight:
         print(system.get_flight_instructions())
@@ -231,10 +260,10 @@ def main():
                 output_dir = results['output_dir']
                 os.chdir(output_dir)
                 port = 8001
-                handler = http.server.SimpleHTTPRequestHandler
+                handler = NoCacheHTTPRequestHandler
                 with socketserver.TCPServer(("", port), handler) as httpd:
                     url = f"http://localhost:{port}/hyperlapse_viewer.html"
-                    print(f"\n🌐 Serving interactive viewer at: {url}")
+                    print(f"\nServing interactive viewer at: {url}")
                     try:
                         import webbrowser
                         webbrowser.open(url)
@@ -246,10 +275,74 @@ def main():
                     except KeyboardInterrupt:
                         print("\nServer stopped.")
     
+    elif args.serve is not None or args.list_reports:
+        # Find available output directories or files
+        output_base = Path(args.output)
+        viewer_file = output_base / 'hyperlapse_viewer.html'
+        
+        if viewer_file.exists():
+            # Single output in base dir
+            output_dirs = [output_base]
+        else:
+            # Look for subdirs with viewer
+            output_dirs = [d for d in output_base.glob('*/') if (d / 'hyperlapse_viewer.html').exists()]
+        
+        output_dirs.sort(key=lambda x: x.stat().st_mtime if x.is_dir() else (x / 'hyperlapse_viewer.html').stat().st_mtime, reverse=True)
+        
+        selected_dir = None
+        if args.serve and args.serve != 'newest':
+            # Serve specific folder
+            specific_dir = output_base / args.serve
+            if (specific_dir / 'hyperlapse_viewer.html').exists():
+                selected_dir = specific_dir
+            else:
+                print(f"Report not found: {args.serve}")
+                return
+        elif args.list_reports:
+            print("Available reports:")
+            for i, d in enumerate(output_dirs):
+                mtime = datetime.fromtimestamp(d.stat().st_mtime if d.is_dir() else (d / 'hyperlapse_viewer.html').stat().st_mtime).strftime('%Y-%m-%d %H:%M')
+                print(f"{i+1}. {d.name} (modified: {mtime})")
+            try:
+                choice = int(input("Enter the number of the report to serve: ")) - 1
+                if 0 <= choice < len(output_dirs):
+                    selected_dir = output_dirs[choice]
+                else:
+                    print("Invalid choice.")
+                    return
+            except ValueError:
+                print("Invalid input.")
+                return
+        else:
+            # Serve the newest
+            if output_dirs:
+                selected_dir = output_dirs[0]
+                print(f"Serving newest report: {selected_dir.name}")
+            else:
+                print(f"No reports found in {output_base}")
+                return
+        if selected_dir:
+            print(f"Serving report: {selected_dir.name}")
+            os.chdir(selected_dir)
+            port = 8001
+            handler = NoCacheHTTPRequestHandler
+            with socketserver.TCPServer(("", port), handler) as httpd:
+                url = f"http://localhost:{port}/hyperlapse_viewer.html"
+                print(f"\nServing interactive viewer at: {url}")
+                try:
+                    import webbrowser
+                    webbrowser.open(url)
+                except Exception:
+                    pass
+                print("Press Ctrl+C to stop the server")
+                try:
+                    httpd.serve_forever()
+                except KeyboardInterrupt:
+                    print("\nServer stopped.")
+    
     else:
         parser.print_help()
 
 
 if __name__ == '__main__':
     main()
-

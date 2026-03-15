@@ -15,10 +15,12 @@ This system detects wildfires from drone hyperlapse flights using post-processin
 
 **Current Features:**
 - 📷 **Hyperlapse Image Viewer** - Browse images with telemetry overlay
-- 📍 **GPS Telemetry Extraction** - Parse EXIF data for position, altitude, gimbal angles
+- 📍 **GPS Telemetry Extraction** - Parse EXIF/XMP data for position, altitude, gimbal angles, drone attitude, and camera heading
 - 🗺️ **Interactive Maps** - View flight trajectory on Folium maps
 - 📊 **Altitude Profiles** - Visualize flight elevation changes
 - 📈 **Flight Reports** - Generate summary statistics
+- 🎛️ **HUD Viewer Overlay** - Show azimuth, elevation, attitude, minimap, and altitude profile in the served viewer
+- 🌐 **Timestamped Report Serving** - Generate timestamped output folders and serve the newest or a selected report
 
 **Future:**
 - 🔥 Fire detection with YOLOv8 (coming next)
@@ -121,14 +123,27 @@ python main.py --help-flight
 
 # Analyze hyperlapse folder
 python main.py --analyze data/raw/hyperlapse_images --output data/outputs/
+
+# Serve the newest generated report
+python main.py --serve-latest
+
+# Serve a specific report folder by name
+python main.py --serve 03-15-2026_13-06
+
+# List reports and choose one interactively
+python main.py --list-reports
 ```
+
+Generated reports are written to timestamped folders under `data/outputs/`. When the viewer changes, generate a new report rather than editing an older output folder in place.
 
 ## Telemetry Data
 
-Each hyperlapse image contains metadata in EXIF:
+Each hyperlapse image contains metadata in EXIF/XMP:
 
 - **GPS**: Latitude, longitude, altitude
 - **Gimbal**: Pitch, roll, yaw angles
+- **Drone Attitude**: Pitch, roll, yaw, and speed components when present in DJI XMP
+- **Camera Heading**: Earth-relative heading derived from drone yaw and gimbal yaw
 - **Timing**: Image capture timestamp
 - **Drone**: Model, firmware version
 
@@ -137,6 +152,7 @@ The system extracts this automatically and displays:
 - GPS position minimap
 - Altitude profile chart
 - Flight trajectory visualization
+- Earth-relative azimuth and elevation readouts in the HUD viewer
 
 ## DJI Mini 4 Pro Notes
 
@@ -178,29 +194,32 @@ The system extracts this automatically and displays:
 
 ```python
 from src.visualization.telemetry import TelemetrySequence
-from src.visualization.viewer import HyperlapseViewer, TrajectoryMapGenerator
+from src.visualization.viewer import TrajectoryMapGenerator
 
 # Load hyperlapse images
 telem_seq = TelemetrySequence('data/raw/my_hyperlapse/')
 
-# Extract GPS, altitude, gimbal from EXIF
+# Extract GPS, altitude, gimbal, and attitude from EXIF/XMP
 telemetry = telem_seq.extract_telemetry()
 
 # Get flight bounds
 bounds = telem_seq.get_bounds()
 print(f"Flight area: {bounds['north']} - {bounds['south']} lat")
 
-# Create viewer
-viewer = HyperlapseViewer('data/raw/my_hyperlapse/', telem_seq)
-img = viewer.get_image_at_index(0)  # Get first image
-telem = viewer.get_telemetry_at_index(0)
-img_with_overlay = viewer.draw_telemetry_overlay(img, telem)
-
-# Generate maps
+# Generate maps and interactive report assets
 map_gen = TrajectoryMapGenerator(telem_seq)
 map_gen.create_trajectory_map('trajectory.html')
 map_gen.create_altitude_profile('altitude_profile.png')
+map_gen.create_interactive_video_viewer('hyperlapse_viewer.html')
 ```
+
+## Viewer And Reports
+
+- The HTML viewer is generated into each report folder as `hyperlapse_viewer.html`.
+- Reports are timestamped like `03-15-2026_13-06/` so older analysis snapshots remain inspectable.
+- `--serve-latest` serves the newest report on `http://localhost:8001/hyperlapse_viewer.html` with cache disabled.
+- The viewer includes a HUD-style center sight, top azimuth ruler, right elevation ruler, minimap, and slide-out altitude profile.
+- The altitude shown in the telemetry/report is GPS altitude above mean sea level, not above local ground.
 
 ## Fire Detection (Future)
 
@@ -209,6 +228,54 @@ Once implemented, will use:
 - **Input**: Hyperlapse images or extracted frames
 - **Output**: Fire bounding boxes with confidence scores → GPS locations
 - **Training**: Custom dataset from fire/drone imagery
+
+## 3D Object Geolocation
+
+The repo now includes a multi-view triangulation path for future YOLOv8 detections.
+
+- Single-view detections can be projected only if you provide a known target altitude plane.
+- True 3D object placement uses two or more detections of the same object from different frames.
+- Output is latitude, longitude, and altitude above sea level.
+
+Use [src/visualization/map_generator.py](src/visualization/map_generator.py) through `FireGeolocation.triangulate_observations(...)` with observations shaped like:
+
+```python
+observations = [
+   {
+      'drone_lat': 34.145123,
+      'drone_lon': -118.029201,
+      'drone_altitude_m': 242.4,
+      'camera_heading': 91.3,
+      'drone_pitch': 0.0,
+      'gimbal_pitch': -34.6,
+      'bbox': (1180, 420, 1300, 560),
+      'frame_width': 3840,
+      'frame_height': 2160,
+      'horizontal_fov_deg': 70.0,
+      'vertical_fov_deg': 56.0,
+      'confidence': 0.93,
+   },
+   {
+      'drone_lat': 34.145044,
+      'drone_lon': -118.029015,
+      'drone_altitude_m': 242.3,
+      'camera_heading': 102.4,
+      'drone_pitch': 0.0,
+      'gimbal_pitch': -31.9,
+      'bbox': (980, 440, 1100, 575),
+      'frame_width': 3840,
+      'frame_height': 2160,
+      'horizontal_fov_deg': 70.0,
+      'vertical_fov_deg': 56.0,
+      'confidence': 0.91,
+   },
+]
+
+geolocator = FireGeolocation(config={})
+object_fix = geolocator.triangulate_observations(observations)
+```
+
+That result can be written to HTML maps or GeoJSON using `MapGenerator.export_geojson(...)`.
 
 ## Safety
 

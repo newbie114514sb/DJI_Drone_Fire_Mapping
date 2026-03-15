@@ -300,6 +300,69 @@ class TrajectoryMapGenerator:
             logger.error(f"Altitude profile error: {e}")
             return False
     
+    def _encode_video_variants(self, out_dir: Path, fps: int = 5) -> List[Tuple[str, str]]:
+        """Encode a browser-playable WebM file and return available (filename, mime_type)."""
+        images = self.telemetry_sequence.images
+        if not images:
+            return []
+
+        first = cv2.imread(str(images[0]))
+        if first is None:
+            return []
+
+        h, w = first.shape[:2]
+        max_width = 1280
+        if w > max_width:
+            scale = max_width / float(w)
+            w = int(w * scale)
+            h = int(h * scale)
+
+        video_path = out_dir / 'hyperlapse.webm'
+        fourcc = cv2.VideoWriter_fourcc(*'VP80')
+        writer = cv2.VideoWriter(str(video_path), fourcc, fps, (w, h))
+        if not writer.isOpened():
+            logger.warning('Video writer failed to open for hyperlapse.webm using codec VP80')
+            writer.release()
+            return []
+
+        for img_path in images:
+            frame = cv2.imread(str(img_path))
+            if frame is None:
+                continue
+            if frame.shape[1] != w or frame.shape[0] != h:
+                frame = cv2.resize(frame, (w, h), interpolation=cv2.INTER_AREA)
+            writer.write(frame)
+        writer.release()
+
+        if video_path.exists() and video_path.stat().st_size > 0:
+            logger.info(f"Video encoded to {video_path}")
+            return [('hyperlapse.webm', 'video/webm')]
+
+        return []
+
+    def _prepare_preview_frames(self, out_dir: Path, max_width: int = 1280) -> List[str]:
+        """Create downscaled JPG preview frames for browser-side fallback playback."""
+        frames_dir = out_dir / 'frames'
+        frames_dir.mkdir(parents=True, exist_ok=True)
+
+        frame_paths = []
+        for index, img_path in enumerate(self.telemetry_sequence.images):
+            frame = cv2.imread(str(img_path))
+            if frame is None:
+                continue
+
+            height, width = frame.shape[:2]
+            if width > max_width:
+                scale = max_width / float(width)
+                frame = cv2.resize(frame, (int(width * scale), int(height * scale)), interpolation=cv2.INTER_AREA)
+
+            output_name = f"frame_{index:04d}.jpg"
+            output_path = frames_dir / output_name
+            cv2.imwrite(str(output_path), frame, [int(cv2.IMWRITE_JPEG_QUALITY), 82])
+            frame_paths.append(f"frames/{output_name}")
+
+        return frame_paths
+
     def create_interactive_video_viewer(self, output_path: str) -> bool:
         """Create an interactive HTML video viewer with telemetry overlay and toggleable minimap"""
         if not self.telemetry_sequence:
@@ -313,589 +376,851 @@ class TrajectoryMapGenerator:
             logger.error("No trajectory data available")
             return False
         
-        # Create HTML content with relative image paths
-        import json, os
+        import json
         out_dir = Path(output_path).parent
-        images_dir = out_dir / 'images'
-        images_dir.mkdir(exist_ok=True)
-        copied_images = []
-        for img_path in self.telemetry_sequence.images:
-            img_name = Path(img_path).name
-            dest_path = images_dir / img_name
-            shutil.copy(img_path, dest_path)
-            copied_images.append(f"images/{img_name}")
+
+        # Encode browser-playable video variants for smooth native playback
+        fps = 5
+        logger.info("Encoding image sequence to video...")
+        video_sources = self._encode_video_variants(out_dir, fps=fps)
+        frame_files = self._prepare_preview_frames(out_dir)
+
         telemetry_json = json.dumps(self.telemetry_sequence.telemetry)
-        images_json = json.dumps(copied_images)
         trajectory_json = json.dumps([[lat, lon] for lat, lon, alt in trajectory])
+        frame_files_json = json.dumps(frame_files)
+        report_name_json = json.dumps(out_dir.name)
+        build_note_json = json.dumps("Latest build: HUD overlay refresh with restored attitude telemetry")
+        video_sources_html = '\n'.join(
+            [f'            <source src="{filename}" type="{mime_type}">' for filename, mime_type in video_sources]
+        )
         
-        html_content = f"""<!DOCTYPE html>
+        html_content = """<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>DJI Hyperlapse Fire Mapping Viewer</title>
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/leaflet@1.9.3/dist/leaflet.css"/>
-    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.2.2/dist/css/bootstrap.min.css"/>
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     <script src="https://cdn.jsdelivr.net/npm/leaflet@1.9.3/dist/leaflet.js"></script>
-    <script src="https://code.jquery.com/jquery-3.7.1.min.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.2.2/dist/js/bootstrap.bundle.min.js"></script>
     <style>
-        body {{
-            margin: 0;
-            padding: 0;
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            background: #1a1a1a;
-            color: white;
-            overflow: hidden;
-        }}
-        
-        .viewer-container {{
+        *, *::before, *::after { box-sizing: border-box; }
+        html, body {
+            width: 100%; height: 100%; margin: 0; padding: 0;
+            font-family: 'Segoe UI', sans-serif;
+            background: #111; color: white; overflow: hidden;
+        }
+        .viewer-container { display: flex; flex-direction: column; width: 100%; height: 100%; }
+        .video-section { flex: 1; position: relative; background: radial-gradient(circle at top, #3b3b3b 0%, #242424 38%, #111 100%); overflow: hidden; display: flex; align-items: center; justify-content: center; }
+        .report-banner {
+            position: absolute; top: 14px; left: 50%; transform: translateX(-50%);
+            z-index: 960;
+            padding: 8px 14px;
+            border-radius: 999px;
+            border: 1px solid #4a4a4a;
+            background: rgba(0, 0, 0, 0.78);
+            backdrop-filter: blur(10px);
+            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.25);
+            font-size: 12px;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+            color: #d9d9d9;
+            white-space: nowrap;
+        }
+        .build-note {
+            position: absolute; left: 20px; bottom: 96px;
+            z-index: 930;
+            padding: 4px 10px;
+            border-radius: 999px;
+            border: 1px solid rgba(99, 255, 182, 0.24);
+            background: rgba(0, 20, 12, 0.46);
+            color: rgba(120, 255, 202, 0.88);
+            font-size: 10px;
+            letter-spacing: 0.05em;
+            text-transform: uppercase;
+            white-space: nowrap;
+        }
+        #main-video {
+            max-width: 100%; max-height: 100%;
+            width: 100%; height: 100%;
+            object-fit: contain;
+            outline: none;
+        }
+        #frame-fallback {
+            max-width: 100%; max-height: 100%;
+            width: 100%; height: 100%; object-fit: contain;
+        }
+        .azimuth-bar {
+            position: absolute;
+            top: 62px;
+            left: 50%;
+            transform: translateX(-50%);
+            width: min(460px, calc(100vw - 420px));
+            z-index: 950;
+        }
+        .elevation-bar {
+            position: absolute;
+            top: 50%;
+            right: 20px;
+            transform: translateY(-50%);
+            height: min(360px, calc(100vh - 220px));
+            z-index: 950;
+        }
+        .azimuth-ruler {
             position: relative;
-            width: 100vw;
-            height: 100vh;
+            padding-top: 6px;
+            color: #63ffb6;
+            text-align: center;
+            pointer-events: none;
+        }
+        .azimuth-label {
+            margin-bottom: 10px;
+            font-size: 11px;
+            letter-spacing: 0.16em;
+            text-transform: uppercase;
+            color: rgba(153, 255, 216, 0.72);
+        }
+        .azimuth-scale {
+            position: relative;
+            height: 38px;
+            margin: 0 14px 10px;
+        }
+        .azimuth-line {
+            position: absolute;
+            left: 0;
+            right: 0;
+            top: 18px;
+            height: 2px;
+            background: linear-gradient(90deg, rgba(99,255,182,0) 0%, rgba(99,255,182,0.9) 12%, rgba(99,255,182,0.9) 88%, rgba(99,255,182,0) 100%);
+            box-shadow: 0 0 12px rgba(99, 255, 182, 0.32);
+        }
+        .azimuth-line::before {
+            content: '';
+            position: absolute;
+            inset: -14px 0 -14px 0;
+            background:
+                linear-gradient(90deg, transparent 0, transparent calc(50% - 1px), rgba(99,255,182,0.95) calc(50% - 1px), rgba(99,255,182,0.95) calc(50% + 1px), transparent calc(50% + 1px), transparent 100%),
+                repeating-linear-gradient(90deg, transparent 0 38px, rgba(99,255,182,0.6) 38px 40px, transparent 40px 78px);
+            opacity: 0.95;
+        }
+        .azimuth-ticks {
+            position: absolute;
+            top: -2px;
+            left: 8px;
+            right: 8px;
             display: flex;
-            flex-direction: column;
-        }}
-        
-        .video-section {{
-            flex: 1;
+            justify-content: space-between;
+            align-items: center;
+            font-size: 18px;
+            letter-spacing: 0.08em;
+            color: rgba(153, 255, 216, 0.8);
+        }
+        .azimuth-value {
+            font-size: 54px;
+            line-height: 1;
+            font-weight: 800;
+            text-shadow: 0 0 18px rgba(99, 255, 182, 0.22);
+        }
+        .elevation-ruler {
             position: relative;
-            background: #000;
+            width: 112px;
+            height: 100%;
             display: flex;
             align-items: center;
             justify-content: center;
-        }}
-        
-        .video-container {{
-            position: relative;
-            max-width: 90%;
-            max-height: 90%;
-        }}
-        
-        .video-frame {{
-            max-width: 100%;
-            max-height: 100%;
-            border: 2px solid #333;
-            border-radius: 8px;
-            box-shadow: 0 4px 20px rgba(0,0,0,0.5);            width: 100%;
-            height: 100%;
-            object-fit: contain;
-            transition: opacity 0.2s ease-in-out;
-            opacity: 1;        }}
-        
-        .telemetry-overlay {{
+            pointer-events: none;
+        }
+        .elevation-track {
             position: absolute;
-            top: 20px;
-            left: 20px;
-            background: rgba(0, 0, 0, 0.8);
-            padding: 15px;
-            border-radius: 8px;
-            font-family: 'Courier New', monospace;
-            font-size: 14px;
-            min-width: 280px;
-            border: 1px solid #444;
-        }}
-        
-        .telemetry-title {{
-            font-weight: bold;
-            color: #00ff88;
-            margin-bottom: 10px;
-            font-size: 16px;
-        }}
-        
-        .telemetry-item {{
-            margin: 5px 0;
-            display: flex;
-            justify-content: space-between;
-        }}
-        
-        .telemetry-label {{
-            color: #ccc;
-        }}
-        
-        .telemetry-value {{
-            color: #fff;
-            font-weight: bold;
-        }}
-        
-        .controls {{
+            top: 10px;
+            bottom: 10px;
+            right: 36px;
+            width: 2px;
+            background: linear-gradient(180deg, rgba(99,255,182,0) 0%, rgba(99,255,182,0.88) 12%, rgba(99,255,182,0.88) 88%, rgba(99,255,182,0) 100%);
+            box-shadow: 0 0 12px rgba(99, 255, 182, 0.3);
+        }
+        .elevation-track::before {
+            content: '';
             position: absolute;
-            bottom: 20px;
-            left: 50%;
-            transform: translateX(-50%);
-            background: rgba(0, 0, 0, 0.8);
-            padding: 15px 20px;
-            border-radius: 25px;
-            display: flex;
-            align-items: center;
-            gap: 15px;
-            border: 1px solid #444;
-        }}
-        
-        .control-btn {{
-            background: #333;
-            border: none;
-            color: white;
-            padding: 8px 12px;
-            border-radius: 6px;
-            cursor: pointer;
-            transition: all 0.2s;
-            font-size: 14px;
-        }}
-        
-        .control-btn:hover {{
-            background: #555;
-        }}
-        
-        .control-btn.active {{
-            background: #00ff88;
-            color: black;
-        }}
-        
-        .progress-container {{
-            flex: 1;
-            display: flex;
-            align-items: center;
-            gap: 10px;
-        }}
-        
-        .progress-bar {{
-            flex: 1;
-            height: 6px;
-            background: #333;
-            border-radius: 3px;
-            cursor: pointer;
-            position: relative;
-        }}
-        
-        .progress-fill {{
-            height: 100%;
-            background: #00ff88;
-            border-radius: 3px;
-            width: 0%;
-            transition: width 0.1s;
-        }}
-        
-        .time-display {{
-            font-size: 12px;
-            color: #ccc;
-            min-width: 80px;
-            text-align: center;
-        }}
-        
-        .minimap-container {{
+            inset: 0 -18px;
+            background:
+                linear-gradient(180deg, transparent 0, transparent calc(50% - 1px), rgba(99,255,182,0.95) calc(50% - 1px), rgba(99,255,182,0.95) calc(50% + 1px), transparent calc(50% + 1px), transparent 100%),
+                repeating-linear-gradient(180deg, transparent 0 30px, rgba(99,255,182,0.62) 30px 32px, transparent 32px 62px);
+        }
+        .elevation-label {
             position: absolute;
-            top: 20px;
-            right: 20px;
-            width: 300px;
-            height: 200px;
-            background: rgba(0, 0, 0, 0.8);
-            border-radius: 8px;
-            border: 1px solid #444;
-            overflow: hidden;
-            transition: all 0.3s;
-            z-index: 1000;
-        }}
-        
-        .minimap-container.collapsed {{
-            width: 50px;
-            height: 50px;
-        }}
-        
-        .minimap-header {{
-            padding: 8px 12px;
-            background: #333;
-            cursor: pointer;
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-        }}
-        
-        .minimap-title {{
-            font-size: 14px;
-            font-weight: bold;
-        }}
-        
-        .minimap-toggle {{
-            font-size: 12px;
-            color: #ccc;
-        }}
-        
-        .minimap-content {{
-            height: calc(100% - 40px);
-            position: relative;
-        }}
-        
-        .minimap-content.collapsed {{
-            display: none;
-        }}
-        
-        #minimap {{
-            width: 100%;
-            height: 100%;
-        }}
-        
-        .current-position {{
-            position: absolute;
+            right: 0;
             top: 50%;
-            left: 50%;
+            transform: translateY(-50%);
+            font-size: 11px;
+            text-transform: uppercase;
+            letter-spacing: 0.14em;
+            color: rgba(153, 255, 216, 0.72);
+            writing-mode: vertical-rl;
+            text-orientation: mixed;
+        }
+        .elevation-value {
+            position: absolute;
+            right: 52px;
+            top: 50%;
+            transform: translateY(-50%);
+            color: #63ffb6;
+            font-size: 34px;
+            font-weight: 800;
+            line-height: 1;
+            text-shadow: 0 0 18px rgba(99, 255, 182, 0.22);
+        }
+        .telemetry-overlay {
+            position: absolute; top: 14px; left: 14px;
+            background: rgba(0, 14, 8, 0.38);
+            padding: 14px 16px; border-radius: 14px;
+            font-family: 'Courier New', monospace; font-size: 13px;
+            width: 320px; max-width: calc(100vw - 32px); border: 1px solid rgba(99, 255, 182, 0.28); z-index: 940;
+            backdrop-filter: blur(8px);
+            color: #63ffb6;
+            box-shadow: inset 0 0 24px rgba(99, 255, 182, 0.08);
+        }
+        .telemetry-title { font-weight: bold; color: #63ffb6; margin-bottom: 10px; font-size: 14px; letter-spacing: 0.12em; }
+        .telemetry-item { margin: 3px 0; display: flex; justify-content: space-between; gap: 8px; }
+        .telemetry-label { color: rgba(153, 255, 216, 0.78); text-transform: uppercase; letter-spacing: 0.06em; font-size: 11px; }
+        .telemetry-value { color: #63ffb6; font-weight: bold; text-align: right; }
+        .hud-center {
+            position: absolute;
+            left: 50%; top: 50%; transform: translate(-50%, -50%);
+            width: 360px; height: 280px; z-index: 938; pointer-events: none;
+        }
+        .hud-ladder {
+            position: absolute;
+            left: 50%; top: 50%; width: 280px; height: 160px;
             transform: translate(-50%, -50%);
-            width: 12px;
-            height: 12px;
-            background: red;
-            border: 2px solid white;
+            opacity: 0.9;
+        }
+        .hud-ladder::before {
+            content: '';
+            position: absolute;
+            inset: 0;
+            background:
+                linear-gradient(180deg, transparent 0, transparent calc(50% - 1px), rgba(99,255,182,0.5) calc(50% - 1px), rgba(99,255,182,0.5) calc(50% + 1px), transparent calc(50% + 1px), transparent 100%),
+                repeating-linear-gradient(180deg, transparent 0 23px, rgba(99,255,182,0.2) 23px 24px, transparent 24px 48px);
+            mask: linear-gradient(90deg, transparent 0, black 18%, black 82%, transparent 100%);
+        }
+        .hud-horizon {
+            position: absolute;
+            left: 50%; top: 50%; width: 250px; height: 2px;
+            transform: translate(-50%, -50%);
+            background: linear-gradient(90deg, rgba(0,0,0,0) 0%, #63ffb6 18%, #63ffb6 82%, rgba(0,0,0,0) 100%);
+            box-shadow: 0 0 10px rgba(99, 255, 182, 0.4);
+        }
+        .hud-horizon::before,
+        .hud-horizon::after {
+            content: '';
+            position: absolute;
+            top: -12px;
+            width: 34px;
+            height: 26px;
+            border-top: 2px solid rgba(99, 255, 182, 0.95);
+        }
+        .hud-horizon::before {
+            left: 28px;
+            border-left: 2px solid rgba(99, 255, 182, 0.95);
+        }
+        .hud-horizon::after {
+            right: 28px;
+            border-right: 2px solid rgba(99, 255, 182, 0.95);
+        }
+        .hud-reticle {
+            position: absolute;
+            left: 50%; top: 50%; width: 74px; height: 74px;
+            transform: translate(-50%, -50%);
+            border: 1px solid rgba(99, 255, 182, 0.85);
             border-radius: 50%;
-            z-index: 1000;
-            box-shadow: 0 0 10px red;
-        }}
-        
-        .loading {{
+            box-shadow: 0 0 12px rgba(99, 255, 182, 0.24);
+            background: radial-gradient(circle, rgba(99,255,182,0.14) 0%, rgba(99,255,182,0.03) 42%, rgba(0,0,0,0) 70%);
+        }
+        .hud-reticle::before,
+        .hud-reticle::after {
+            content: '';
             position: absolute;
-            top: 50%;
-            left: 50%;
+            background: #63ffb6;
+            box-shadow: 0 0 8px rgba(99, 255, 182, 0.4);
+        }
+        .hud-reticle::before {
+            left: 50%; top: -22px; width: 2px; height: 118px; transform: translateX(-50%);
+        }
+        .hud-reticle::after {
+            top: 50%; left: -22px; width: 118px; height: 2px; transform: translateY(-50%);
+        }
+        .hud-reticle-inner {
+            position: absolute;
+            left: 50%; top: 50%; width: 16px; height: 16px;
             transform: translate(-50%, -50%);
-            color: #00ff88;
-            font-size: 18px;
-        }}
-        
-        @media (max-width: 768px) {{
-            .telemetry-overlay {{
+            border: 2px solid rgba(99, 255, 182, 0.9);
+            border-radius: 50%;
+            box-shadow: 0 0 10px rgba(99, 255, 182, 0.35);
+        }
+        .controls {
+            background: #1a1a1a; border-top: 1px solid #333;
+            padding: 10px 16px; display: flex; align-items: center; gap: 10px;
+        }
+        .control-btn {
+            background: #2a2a2a; border: 1px solid #444; color: white;
+            padding: 7px 12px; border-radius: 7px; cursor: pointer;
+            font-size: 14px; transition: background 0.15s; white-space: nowrap;
+        }
+        .control-btn:hover { background: #383838; }
+        .slider-wrap { flex: 1; display: flex; align-items: center; gap: 8px; }
+        .time-display { font-size: 12px; color: #aaa; min-width: 42px; text-align: center; }
+        input[type=range] {
+            flex: 1; -webkit-appearance: none; height: 5px;
+            border-radius: 3px; background: #444; outline: none; cursor: pointer;
+        }
+        input[type=range]::-webkit-slider-thumb {
+            -webkit-appearance: none; width: 14px; height: 14px;
+            border-radius: 50%; background: #00ff88; cursor: pointer; border: 2px solid #111;
+        }
+        .minimap-container {
+            position: absolute; top: 14px; right: 14px;
+            width: 260px; background: rgba(0,0,0,0.85);
+            border-radius: 10px; border: 1px solid #444; overflow: hidden; z-index: 900;
+        }
+        .minimap-container.collapsed { width: 90px; }
+        .panel-header {
+            padding: 7px 11px; background: rgba(0,0,0,0.9);
+            cursor: pointer; display: flex; align-items: center; justify-content: space-between;
+            font-size: 13px; font-weight: bold; user-select: none;
+        }
+        .panel-header span { font-size: 11px; color: #aaa; }
+        .minimap-body { height: 170px; }
+        .minimap-body.collapsed { display: none; }
+        #minimap { width: 100%; height: 100%; }
+        .profile-panel {
+            position: absolute;
+            right: 14px;
+            bottom: 84px;
+            width: 344px;
+            display: flex;
+            align-items: stretch;
+            z-index: 920;
+            transform: translateX(300px);
+            transition: transform 0.22s ease;
+        }
+        .profile-panel.open { transform: translateX(0); }
+        .profile-tab-button {
+            width: 44px;
+            border: 1px solid #444;
+            border-right: none;
+            border-radius: 12px 0 0 12px;
+            background: rgba(0, 0, 0, 0.86);
+            color: #fff;
+            cursor: pointer;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            gap: 8px;
+            padding: 12px 6px;
+            font: inherit;
+            writing-mode: vertical-rl;
+            text-orientation: mixed;
+        }
+        .profile-content {
+            width: 300px;
+            background: rgba(0, 0, 0, 0.86);
+            border: 1px solid #444;
+            border-radius: 0 12px 12px 12px;
+            overflow: hidden;
+            backdrop-filter: blur(10px);
+            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.25);
+        }
+        .profile-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 10px 12px;
+            font-size: 12px;
+            font-weight: 700;
+            letter-spacing: 0.06em;
+            text-transform: uppercase;
+            color: #d2d2d2;
+            background: rgba(255, 255, 255, 0.04);
+        }
+        .profile-body {
+            padding: 10px;
+        }
+        .profile-image {
+            width: 100%;
+            display: block;
+            border-radius: 8px;
+            border: 1px solid #333;
+            background: #121212;
+        }
+        @media (max-width: 980px) {
+            .report-banner {
                 top: 10px;
-                left: 10px;
-                min-width: 250px;
-                font-size: 12px;
-            }}
-            
-            .minimap-container {{
-                top: 10px;
-                right: 10px;
+                max-width: calc(100vw - 28px);
+                overflow: hidden;
+                text-overflow: ellipsis;
+            }
+            .build-note {
+                left: 14px;
+                bottom: 128px;
+                max-width: calc(100vw - 28px);
+                overflow: hidden;
+                text-overflow: ellipsis;
+                transform: none;
+            }
+            .azimuth-bar {
+                top: 56px;
+                width: calc(100vw - 60px);
+            }
+            .elevation-bar {
+                top: auto;
+                bottom: 104px;
+                right: 14px;
+                transform: none;
+                height: 180px;
+            }
+            .profile-panel {
+                right: 14px;
+                left: 14px;
+                width: auto;
+                bottom: 132px;
+                transform: translateY(calc(100% - 44px));
+                flex-direction: column-reverse;
+            }
+            .profile-panel.open {
+                transform: translateY(0);
+            }
+            .profile-tab-button {
+                width: 100%;
+                writing-mode: horizontal-tb;
+                text-orientation: initial;
+                border-right: 1px solid #444;
+                border-top: none;
+                border-radius: 0 0 12px 12px;
+                flex-direction: row;
+                padding: 10px 12px;
+            }
+            .profile-content {
+                width: 100%;
+                border-radius: 12px 12px 0 0;
+            }
+            .telemetry-overlay {
                 width: 250px;
-                height: 150px;
-            }}
-            
-            .controls {{
-                bottom: 10px;
-                padding: 10px 15px;
-                gap: 10px;
-            }}
-        }}
+                font-size: 12px;
+            }
+            .azimuth-value { font-size: 34px; }
+            .azimuth-ticks { font-size: 14px; }
+            .elevation-value { font-size: 26px; }
+            .hud-center { width: 250px; height: 220px; }
+            .hud-ladder { width: 220px; height: 120px; }
+            .hud-horizon { width: 180px; }
+        }
     </style>
 </head>
 <body>
-    <div class="viewer-container">
-        <div class="video-section">
-            <div class="video-container">
-                <img id="video-frame" class="video-frame" src="" alt="Loading...">
-                <div class="telemetry-overlay">
-                    <div class="telemetry-title">📡 TELEMETRY DATA</div>
-                    <div class="telemetry-item">
-                        <span class="telemetry-label">Frame:</span>
-                        <span class="telemetry-value" id="frame-number">0</span>
-                    </div>
-                    <div class="telemetry-item">
-                        <span class="telemetry-label">GPS:</span>
-                        <span class="telemetry-value" id="gps-coords">--</span>
-                    </div>
-                    <div class="telemetry-item">
-                        <span class="telemetry-label">Altitude:</span>
-                        <span class="telemetry-value" id="altitude">--</span>
-                    </div>
-                    <div class="telemetry-item">
-                        <span class="telemetry-label">Gimbal:</span>
-                        <span class="telemetry-value" id="gimbal-angle">--</span>
-                    </div>
-                    <div class="telemetry-item">
-                        <span class="telemetry-label">Speed:</span>
-                        <span class="telemetry-value" id="speed">--</span>
-                    </div>
-                    <div class="telemetry-item">
-                        <span class="telemetry-label">Detections:</span>
-                        <span class="telemetry-value" id="detections">None</span>
-                    </div>
-                </div>
-            </div>
-            
+<div class="viewer-container">
+    <div class="video-section">
+        <div class="report-banner" id="report-name"></div>
+        <div class="build-note" id="build-note"></div>
+        <video id="main-video" preload="auto" playsinline>
+    {video_sources_html}
+            Your browser could not load the generated video.
+        </video>
+        <img id="frame-fallback" alt="Frame preview" style="display:none;" />
+
+        <div class="hud-center">
+            <div class="hud-ladder"></div>
+            <div class="hud-horizon" id="hud-horizon"></div>
+            <div class="hud-reticle"><div class="hud-reticle-inner"></div></div>
         </div>
-        
-        <div class="controls">
-            <button class="control-btn" id="play-pause" onclick="togglePlayPause()">
-                <i class="fas fa-play"></i>
-            </button>
-            <button class="control-btn" onclick="previousFrame()">
-                <i class="fas fa-step-backward"></i>
-            </button>
-            <button class="control-btn" onclick="nextFrame()">
-                <i class="fas fa-step-forward"></i>
-            </button>
-            
-            <div class="progress-container">
-                <span class="time-display" id="current-time">0:00</span>
-                <div class="progress-bar" id="progress-bar" onclick="seekTo(event)">
-                    <div class="progress-fill" id="progress-fill"></div>
+
+        <div class="azimuth-bar">
+            <div class="azimuth-ruler">
+                <div class="azimuth-label">Azimuth Relative To Earth</div>
+                <div class="azimuth-scale">
+                    <div class="azimuth-line"></div>
+                    <div class="azimuth-ticks"><span>W</span><span>NW</span><span>N</span><span>NE</span><span>E</span></div>
                 </div>
-                <span class="time-display" id="total-time">0:00</span>
+                <div class="azimuth-value" id="earth-azimuth">--</div>
             </div>
-            
-            <button class="control-btn" id="speed-btn" onclick="changeSpeed()">
-                1x
+        </div>
+
+        <div class="elevation-bar">
+            <div class="elevation-ruler">
+                <div class="elevation-track"></div>
+                <div class="elevation-value" id="earth-elevation">--</div>
+                <div class="elevation-label">Elevation Relative To Earth</div>
+            </div>
+        </div>
+
+        <div class="telemetry-overlay">
+            <div class="telemetry-title">HUD TELEMETRY</div>
+            <div class="telemetry-item"><span class="telemetry-label">Frame:</span><span class="telemetry-value" id="t-frame">--</span></div>
+            <div class="telemetry-item"><span class="telemetry-label">GPS:</span><span class="telemetry-value" id="t-gps">--</span></div>
+            <div class="telemetry-item"><span class="telemetry-label">Altitude MSL:</span><span class="telemetry-value" id="t-alt">--</span></div>
+            <div class="telemetry-item"><span class="telemetry-label">Camera Heading:</span><span class="telemetry-value" id="t-heading">--</span></div>
+            <div class="telemetry-item"><span class="telemetry-label">Drone Attitude:</span><span class="telemetry-value" id="t-attitude">--</span></div>
+            <div class="telemetry-item"><span class="telemetry-label">Gimbal:</span><span class="telemetry-value" id="t-gimbal">--</span></div>
+            <div class="telemetry-item"><span class="telemetry-label">Speed:</span><span class="telemetry-value" id="t-speed">--</span></div>
+        </div>
+
+        <div class="minimap-container collapsed" id="minimap-container">
+            <div class="panel-header" onclick="toggleMinimap()">
+                <div>&#128506; Map</div><span id="map-toggle">&#9654;</span>
+            </div>
+            <div class="minimap-body collapsed" id="minimap-body">
+                <div id="minimap"></div>
+            </div>
+        </div>
+
+        <div class="profile-panel" id="profile-panel">
+            <button class="profile-tab-button" type="button" onclick="toggleProfilePanel()">
+                <span>Altitude Profile</span>
+                <span id="profile-toggle">&#9664;</span>
             </button>
-            <button class="control-btn" onclick="setOneMinute()" id="one-minute">1 min</button>
-            <button class="control-btn" onclick="openMap()">Map</button>
+            <div class="profile-content">
+                <div class="profile-header">
+                    <span>Altitude Profile</span>
+                    <span>MSL</span>
+                </div>
+                <div class="profile-body">
+                    <img class="profile-image" src="altitude_profile.png" alt="Altitude profile graph" />
+                </div>
+            </div>
         </div>
     </div>
 
-    <script>
-        // Telemetry data
-        const telemetryData = {telemetry_json};
-        const imageFiles = {images_json};
-        
-        // Viewer state
-        let currentFrame = 0;
-        let isPlaying = false;
-        let playbackSpeed = 1;
-        let intervalId = null;
-        const frameRate = 30; // FPS
-        
-        // Map variables (only used if popup opened)
-        let map = null;
-        let trajectoryLayer = null;
-        let currentMarker = null;
-        
-        // Initialize viewer
-        document.addEventListener('DOMContentLoaded', function() {{
-            initializeViewer();
-            // no embedded map by default
-            updateFrame();
-        }});
-        
-        function initializeViewer() {{
-            document.getElementById('total-time').textContent = formatTime(imageFiles.length / frameRate);
-            document.addEventListener('keydown', handleKeyPress);
-        }}
-        
-        function initializeMap() {{
-            const centerLat = ({bounds['north']} + {bounds['south']}) / 2;
-            const centerLon = ({bounds['east']} + {bounds['west']}) / 2;
-            
-            map = L.map('minimap').setView([centerLat, centerLon], 16);
-            
-            L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{
-                attribution: '© OpenStreetMap contributors'
-            }}).addTo(map);
-            
-            // Add trajectory
-            trajectoryLayer = L.polyline({trajectory_json}, {{
-                color: '#00ff88',
-                weight: 3,
-                opacity: 0.8
-            }}).addTo(map);
-            
-            // Fit bounds
-            map.fitBounds(trajectoryLayer.getBounds());
-            
-            // Add start/end markers
-            const trajectoryCoords = {trajectory_json};
-            if (trajectoryCoords.length > 0) {{
-                L.circleMarker(trajectoryCoords[0], {{
-                    color: 'green',
-                    fillColor: 'green',
-                    fillOpacity: 0.8,
-                    radius: 8
-                }}).addTo(map).bindPopup('START');
-                
-                L.circleMarker(trajectoryCoords[trajectoryCoords.length - 1], {{
-                    color: 'red',
-                    fillColor: 'red',
-                    fillOpacity: 0.8,
-                    radius: 8
-                }}).addTo(map).bindPopup('END');
-            }}
-        }}
-        
-        function updateFrame() {{
-            if (currentFrame >= imageFiles.length) {{
-                currentFrame = imageFiles.length - 1;
-                stopPlayback();
-            }}
-            
-            // Update image
-            document.getElementById('video-frame').src = imageFiles[currentFrame];
-            
-            // Update telemetry
-            const telemetry = telemetryData[currentFrame] || {{}};
-            const gps = telemetry.gps || {{}};
-            
-            document.getElementById('frame-number').textContent = currentFrame + 1;
-            document.getElementById('gps-coords').textContent = 
-                gps.latitude ? `${{gps.latitude.toFixed(6)}}, ${{gps.longitude.toFixed(6)}}` : '--';
-            document.getElementById('altitude').textContent = 
-                gps.altitude ? `${{gps.altitude.toFixed(1)}}m` : '--';
-            document.getElementById('gimbal-angle').textContent = 
-                telemetry.gimbal ? `${{telemetry.gimbal.pitch || 0}}°` : '--';
-            document.getElementById('speed').textContent = 
-                telemetry.speed ? `${{telemetry.speed.toFixed(1)}} m/s` : '--';
-            document.getElementById('detections').textContent = 'None (Future)';
-            
-            // Update progress
-            const progress = (currentFrame / (imageFiles.length - 1)) * 100;
-            document.getElementById('progress-fill').style.width = `${{progress}}%`;
-            document.getElementById('current-time').textContent = formatTime(currentFrame / frameRate);
-            
-            // Update map marker
-            updateMapMarker(gps);
-        }}
-        
-        function updateMapMarker(gps) {{
-            // no-op if map not created
-            if (!map) return;
-            if (currentMarker) {{
-                map.removeLayer(currentMarker);
-            }}
-            
-            if (gps.latitude && gps.longitude) {{
-                currentMarker = L.circleMarker([gps.latitude, gps.longitude], {{
-                    color: 'red',
-                    fillColor: 'red',
-                    fillOpacity: 1,
-                    radius: 8,
-                    weight: 2
-                }}).addTo(map);
-            }}
-        }}
-        
-        function togglePlayPause() {{
-            const btn = document.getElementById('play-pause');
-            const icon = btn.querySelector('i');
-            
-            if (isPlaying) {{
-                stopPlayback();
-                icon.className = 'fas fa-play';
-            }} else {{
-                startPlayback();
-                icon.className = 'fas fa-pause';
-            }}
-        }}
-        
-        function setOneMinute() {{
-            // adjust frameRate so full sequence plays in 60s
-            const total = imageFiles.length;
-            playbackSpeed = (total / 60) / frameRate;
-            document.getElementById('speed-btn').textContent = `${{(frameRate * playbackSpeed).toFixed(1)}} fps`;
-            if (isPlaying) {{
-                stopPlayback();
-                startPlayback();
-            }}
-        }}
-        
-        function openMap() {{
-            window.open('trajectory_map.html', '_blank');
-        }}
-        
-        function startPlayback() {{
-            if (isPlaying) return;
-            isPlaying = true;
-            intervalId = setInterval(() => {{
-                currentFrame++;
-                if (currentFrame >= imageFiles.length) {{
-                    stopPlayback();
-                }} else {{
-                    updateFrame();
-                }}
-            }}, (1000 / frameRate) / playbackSpeed);
-        }}
-        
-        function stopPlayback() {{
-            isPlaying = false;
-            if (intervalId) {{
-                clearInterval(intervalId);
-                intervalId = null;
-            }}
-        }}
-        
-        function nextFrame() {{
-            if (currentFrame < imageFiles.length - 1) {{
-                currentFrame++;
-                updateFrame();
-            }}
-        }}
-        
-        function previousFrame() {{
-            if (currentFrame > 0) {{
-                currentFrame--;
-                updateFrame();
-            }}
-        }}
-        
-        function seekTo(event) {{
-            const rect = event.target.getBoundingClientRect();
-            const x = event.clientX - rect.left;
-            const percentage = x / rect.width;
-            currentFrame = Math.floor(percentage * (imageFiles.length - 1));
-            updateFrame();
-        }}
-        
-        function changeSpeed() {{
+    <div class="controls">
+        <button class="control-btn" id="btn-play" onclick="togglePlay()"><i class="fas fa-play"></i></button>
+        <button class="control-btn" onclick="stepFrame(-1)"><i class="fas fa-step-backward"></i></button>
+        <button class="control-btn" onclick="stepFrame(1)"><i class="fas fa-step-forward"></i></button>
+        <div class="slider-wrap">
+            <span class="time-display" id="t-current">0:00</span>
+            <input type="range" id="seek-bar" min="0" max="1000" value="0"
+                   oninput="onSeek(this.value)" onmousedown="seekStart()" onmouseup="seekEnd()">
+            <span class="time-display" id="t-total">0:00</span>
+        </div>
+        <button class="control-btn" id="btn-speed" onclick="cycleSpeed()">1x</button>
+        <button class="control-btn" onclick="toggleMinimap()">Map</button>
+    </div>
+</div>
+
+<script>
+    const telemetryData = {telemetry_json};
+    const trajectory   = {trajectory_json};
+    const frameFiles   = {frame_files_json};
+    const reportName   = {report_name_json};
+    const buildNote    = {build_note_json};
+    const FPS = {fps};
+
+    const vid   = document.getElementById('main-video');
+    const fallbackImg = document.getElementById('frame-fallback');
+    const bar   = document.getElementById('seek-bar');
+    let isSeeking = false;
+    let map = null, mapMarker = null, mapInitialized = false;
+    let useFrameFallback = false;
+    let fallbackFrame = 0;
+    let fallbackPlaying = false;
+    let fallbackRaf = null;
+    let fallbackLastTs = 0;
+    let fallbackPlaybackRate = 1;
+
+    function currentDuration() {
+        return useFrameFallback ? (frameFiles.length / FPS) : (vid.duration || 0);
+    }
+
+    function currentTimeValue() {
+        return useFrameFallback ? (fallbackFrame / FPS) : vid.currentTime;
+    }
+
+    function syncFromFrame(frame) {
+        const safeFrame = Math.max(0, Math.min(frame, telemetryData.length - 1));
+        updateTelemetry(safeFrame);
+        updateMapMarker(safeFrame);
+        document.getElementById('t-current').textContent = fmt(safeFrame / FPS);
+        const duration = currentDuration();
+        if (duration > 0) {
+            bar.value = ((safeFrame / FPS) / duration) * 1000;
+        }
+    }
+
+    function showFallbackFrame(frame) {
+        if (!frameFiles.length) return;
+        fallbackFrame = Math.max(0, Math.min(frame, frameFiles.length - 1));
+        fallbackImg.src = frameFiles[fallbackFrame];
+        syncFromFrame(fallbackFrame);
+    }
+
+    function activateFrameFallback() {
+        if (useFrameFallback) return;
+        useFrameFallback = true;
+        vid.pause();
+        vid.style.display = 'none';
+        fallbackImg.style.display = 'block';
+        document.getElementById('t-total').textContent = fmt(frameFiles.length / FPS);
+        showFallbackFrame(fallbackFrame);
+    }
+
+    function startFallbackPlayback() {
+        if (fallbackPlaying || !frameFiles.length) return;
+        fallbackPlaying = true;
+        fallbackLastTs = 0;
+        document.querySelector('#btn-play i').className = 'fas fa-pause';
+
+        const step = (timestamp) => {
+            if (!fallbackPlaying) return;
+            if (!fallbackLastTs) fallbackLastTs = timestamp;
+            if (timestamp - fallbackLastTs >= (1000 / (FPS * fallbackPlaybackRate))) {
+                fallbackLastTs = timestamp;
+                if (fallbackFrame >= frameFiles.length - 1) {
+                    stopFallbackPlayback();
+                    return;
+                }
+                showFallbackFrame(fallbackFrame + 1);
+            }
+            fallbackRaf = requestAnimationFrame(step);
+        };
+
+        fallbackRaf = requestAnimationFrame(step);
+    }
+
+    function stopFallbackPlayback() {
+        fallbackPlaying = false;
+        if (fallbackRaf) {
+            cancelAnimationFrame(fallbackRaf);
+            fallbackRaf = null;
+        }
+        document.querySelector('#btn-play i').className = 'fas fa-play';
+    }
+
+    // ── Telemetry sync ────────────────────────────────────────────
+    vid.addEventListener('timeupdate', () => {
+        if (useFrameFallback) return;
+        if (!isSeeking) updateSeekBar();
+        const frame = Math.min(Math.round(vid.currentTime * FPS), telemetryData.length - 1);
+        updateTelemetry(frame);
+        updateMapMarker(frame);
+        document.getElementById('t-current').textContent = fmt(vid.currentTime);
+    });
+
+    vid.addEventListener('loadedmetadata', () => {
+        document.getElementById('t-total').textContent = fmt(vid.duration);
+        document.getElementById('t-current').textContent = fmt(0);
+        updateTelemetry(0);
+        updateSeekBar();
+    });
+
+    vid.addEventListener('loadeddata', () => {
+        updateTelemetry(0);
+        updateMapMarker(0);
+    });
+
+    vid.addEventListener('error', () => {
+        activateFrameFallback();
+    });
+
+    window.addEventListener('load', () => {
+        document.getElementById('report-name').textContent = reportName;
+        document.getElementById('build-note').textContent = buildNote;
+        updateTelemetry(0);
+        document.getElementById('t-total').textContent = fmt(frameFiles.length / FPS);
+        if (frameFiles.length) {
+            activateFrameFallback();
+        } else {
+            window.setTimeout(() => {
+                if (!useFrameFallback && vid.readyState < 2) {
+                    activateFrameFallback();
+                }
+            }, 1200);
+        }
+    });
+
+    vid.addEventListener('play',  () => { document.querySelector('#btn-play i').className = 'fas fa-pause'; });
+    vid.addEventListener('pause', () => { document.querySelector('#btn-play i').className = 'fas fa-play'; });
+    vid.addEventListener('ended', () => { document.querySelector('#btn-play i').className = 'fas fa-play'; });
+
+    function updateTelemetry(idx) {
+        const t = telemetryData[idx] || {};
+        const g = t.gps || {};
+        const d = t.drone || {};
+        const azimuth = t.camera_heading ?? null;
+        const elevation = ((d.pitch ?? 0) + (t.gimbal?.pitch ?? 0));
+        const hasElevation = d.pitch != null || (t.gimbal && t.gimbal.pitch != null);
+        document.getElementById('t-frame').textContent    = idx + 1;
+        document.getElementById('t-gps').textContent      = g.latitude  ? `${g.latitude.toFixed(5)}, ${g.longitude.toFixed(5)}` : '--';
+        document.getElementById('t-alt').textContent      = g.altitude  ? `${g.altitude.toFixed(1)}m` : '--';
+        document.getElementById('t-heading').textContent  = t.camera_heading != null ? `${t.camera_heading.toFixed(1)}\\u00b0` : '--';
+        document.getElementById('t-attitude').textContent = (d.yaw != null) ? `Y:${d.yaw.toFixed(1)}\\u00b0 P:${(d.pitch ?? 0).toFixed(1)}\\u00b0 R:${(d.roll ?? 0).toFixed(1)}\\u00b0` : '--';
+        document.getElementById('t-gimbal').textContent   = t.gimbal ? `P:${t.gimbal.pitch||0}\\u00b0 R:${t.gimbal.roll||0}\\u00b0 Y:${t.gimbal.yaw||0}\\u00b0` : '--';
+        const spd = d.speed ?? ((d.speed_x != null) ? Math.sqrt(d.speed_x**2 + d.speed_y**2 + d.speed_z**2) : null);
+        document.getElementById('t-speed').textContent    = spd != null ? `${spd.toFixed(1)} m/s` : '--';
+        document.getElementById('earth-azimuth').textContent = azimuth != null ? `${azimuth.toFixed(1)}\u00b0` : '--';
+        document.getElementById('earth-elevation').textContent = hasElevation ? `${elevation.toFixed(1)}\u00b0` : '--';
+        updateHudAttitude(d.roll ?? 0, d.pitch ?? 0);
+    }
+
+    function updateHudAttitude(roll, pitch) {
+        const horizon = document.getElementById('hud-horizon');
+        const clampedPitch = Math.max(-20, Math.min(20, pitch || 0));
+        horizon.style.transform = `translate(-50%, calc(-50% + ${clampedPitch * 3}px)) rotate(${roll || 0}deg)`;
+    }
+
+    // ── Playback controls ─────────────────────────────────────────
+    function togglePlay() {
+        if (useFrameFallback) {
+            fallbackPlaying ? stopFallbackPlayback() : startFallbackPlayback();
+            return;
+        }
+        const playPromise = vid.paused ? vid.play() : Promise.resolve(vid.pause());
+        if (playPromise && typeof playPromise.catch === 'function') {
+            playPromise.catch(() => activateFrameFallback());
+        }
+    }
+
+    function stepFrame(dir) {
+        if (useFrameFallback) {
+            stopFallbackPlayback();
+            showFallbackFrame(fallbackFrame + dir);
+            return;
+        }
+        vid.pause();
+        vid.currentTime = Math.max(0, Math.min(vid.duration, vid.currentTime + dir / FPS));
+        const frame = Math.min(Math.round(vid.currentTime * FPS), telemetryData.length - 1);
+        updateTelemetry(frame);
+        updateMapMarker(frame);
+        updateSeekBar();
+        document.getElementById('t-current').textContent = fmt(vid.currentTime);
+    }
+
+    function cycleSpeed() {
+        if (useFrameFallback) {
             const speeds = [0.5, 1, 2, 4];
-            const currentIndex = speeds.indexOf(playbackSpeed);
-            playbackSpeed = speeds[(currentIndex + 1) % speeds.length];
-            document.getElementById('speed-btn').textContent = `${{playbackSpeed}}x`;
-            
-            if (isPlaying) {{
-                stopPlayback();
-                startPlayback();
-            }}
-        }}
-        
-        function toggleMinimap() {{
-            const container = document.getElementById('minimap-container');
-            const content = document.getElementById('minimap-content');
-            const toggle = document.getElementById('minimap-toggle');
-            
-            if (container.classList.contains('collapsed')) {{
-                container.classList.remove('collapsed');
-                content.classList.remove('collapsed');
-                toggle.textContent = '▼';
-            }} else {{
-                container.classList.add('collapsed');
-                content.classList.add('collapsed');
-                toggle.textContent = '▶';
-            }}
-        }}
-        
-        function handleKeyPress(event) {{
-            switch(event.code) {{
-                case 'Space':
-                    event.preventDefault();
-                    togglePlayPause();
-                    break;
-                case 'ArrowLeft':
-                    event.preventDefault();
-                    previousFrame();
-                    break;
-                case 'ArrowRight':
-                    event.preventDefault();
-                    nextFrame();
-                    break;
-            }}
-        }}
-        
-        function formatTime(seconds) {{
-            const mins = Math.floor(seconds / 60);
-            const secs = Math.floor(seconds % 60);
-            return `${{mins}}:${{secs.toString().padStart(2, '0')}}`;
-        }}
-        
-        // Handle map resize when minimap is toggled
-        document.getElementById('minimap-container').addEventListener('transitionend', function() {{
-            if (map) {{
+            const idx = speeds.indexOf(fallbackPlaybackRate);
+            fallbackPlaybackRate = speeds[(idx + 1) % speeds.length];
+            document.getElementById('btn-speed').textContent = fallbackPlaybackRate + 'x';
+            return;
+        }
+        const speeds = [0.25, 0.5, 1, 2, 4];
+        const idx = speeds.indexOf(vid.playbackRate);
+        vid.playbackRate = speeds[(idx + 1) % speeds.length];
+        document.getElementById('btn-speed').textContent = vid.playbackRate + 'x';
+    }
+
+    // ── Seek bar ──────────────────────────────────────────────────
+    function seekStart() { isSeeking = true; }
+    function seekEnd()   {
+        isSeeking = false;
+        if (useFrameFallback) {
+            showFallbackFrame(fallbackFrame);
+            return;
+        }
+        const frame = Math.min(Math.round(vid.currentTime * FPS), telemetryData.length - 1);
+        updateTelemetry(frame);
+        updateMapMarker(frame);
+        updateSeekBar();
+        document.getElementById('t-current').textContent = fmt(vid.currentTime);
+    }
+    function onSeek(val) {
+        if (useFrameFallback) {
+            const target = Math.round((val / 1000) * (frameFiles.length - 1));
+            showFallbackFrame(target);
+            return;
+        }
+        if (vid.duration) {
+            vid.currentTime = (val / 1000) * vid.duration;
+            const frame = Math.min(Math.round(vid.currentTime * FPS), telemetryData.length - 1);
+            updateTelemetry(frame);
+            updateMapMarker(frame);
+            document.getElementById('t-current').textContent = fmt(vid.currentTime);
+        }
+    }
+    function updateSeekBar() {
+        if (useFrameFallback) {
+            if (frameFiles.length > 1) {
+                bar.value = (fallbackFrame / (frameFiles.length - 1)) * 1000;
+            }
+            return;
+        }
+        if (vid.duration) bar.value = (vid.currentTime / vid.duration) * 1000;
+    }
+
+    // ── Keyboard shortcuts ────────────────────────────────────────
+    document.addEventListener('keydown', e => {
+        if (e.code === 'Space')      { e.preventDefault(); togglePlay(); }
+        if (e.code === 'ArrowRight') { e.preventDefault(); stepFrame(1); }
+        if (e.code === 'ArrowLeft')  { e.preventDefault(); stepFrame(-1); }
+    });
+
+    // ── Minimap ───────────────────────────────────────────────────
+    function toggleMinimap() {
+        const c = document.getElementById('minimap-container');
+        const b = document.getElementById('minimap-body');
+        const t = document.getElementById('map-toggle');
+        const open = c.classList.toggle('collapsed');
+        b.classList.toggle('collapsed', open);
+        t.textContent = open ? '\\u25b6' : '\\u25bc';
+        if (!open) {
+            if (!mapInitialized) {
+                initMap();
+            } else {
                 map.invalidateSize();
-            }}
-        }});
-    </script>
+                const frame = Math.min(Math.round(vid.currentTime * FPS), telemetryData.length - 1);
+                updateMapMarker(frame);
+            }
+        }
+    }
+
+    function toggleProfilePanel() {
+        const panel = document.getElementById('profile-panel');
+        const toggle = document.getElementById('profile-toggle');
+        const open = panel.classList.toggle('open');
+        toggle.textContent = open ? '\u25b6' : '\u25c0';
+    }
+
+    function initMap() {
+        const lats = trajectory.map(p => p[0]);
+        const lons = trajectory.map(p => p[1]);
+        const cLat = (Math.max(...lats) + Math.min(...lats)) / 2;
+        const cLon = (Math.max(...lons) + Math.min(...lons)) / 2;
+        map = L.map('minimap').setView([cLat, cLon], 16);
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { attribution: '\\u00a9 OSM' }).addTo(map);
+        L.polyline(trajectory, { color: '#00ff88', weight: 3 }).addTo(map);
+        if (trajectory.length) {
+            L.circleMarker(trajectory[0], { color:'green', fillColor:'green', fillOpacity:1, radius:7 }).addTo(map).bindPopup('START');
+            L.circleMarker(trajectory[trajectory.length-1], { color:'red', fillColor:'red', fillOpacity:1, radius:7 }).addTo(map).bindPopup('END');
+        }
+        mapMarker = L.circleMarker(trajectory[0] || [cLat, cLon], { color:'red', fillColor:'red', fillOpacity:1, radius:9 }).addTo(map);
+        mapInitialized = true;
+        updateMapMarker(Math.min(Math.round(vid.currentTime * FPS), telemetryData.length - 1));
+    }
+
+    function updateMapMarker(frameIdx) {
+        if (!mapInitialized || !mapMarker) return;
+        const t = telemetryData[frameIdx] || {};
+        const g = t.gps || {};
+        if (g.latitude && g.longitude) mapMarker.setLatLng([g.latitude, g.longitude]);
+    }
+
+    function fmt(s) {
+        if (!isFinite(s)) return '0:00';
+        const mins = Math.floor(s / 60);
+        const secs = Math.floor(s % 60);
+        return `${mins}:${String(secs).padStart(2, '0')}`;
+    }
+
+</script>
 </body>
 </html>"""
 
+        # Replace templated placeholders with actual values
+        html_content = html_content.replace("{telemetry_json}", telemetry_json)
+        html_content = html_content.replace("{trajectory_json}", trajectory_json)
+        html_content = html_content.replace("{frame_files_json}", frame_files_json)
+        html_content = html_content.replace("{fps}", str(fps))
+        html_content = html_content.replace("{video_sources_html}", video_sources_html)
+        html_content = html_content.replace("{report_name_json}", report_name_json)
+        html_content = html_content.replace("{build_note_json}", build_note_json)
         # Write HTML file
         with open(output_path, 'w', encoding='utf-8') as f:
             f.write(html_content)

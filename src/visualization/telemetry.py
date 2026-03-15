@@ -7,6 +7,7 @@ Telemetry extraction from DJI hyperlapse image EXIF data
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple
 import logging
+import xml.etree.ElementTree as ET
 
 logger = logging.getLogger(__name__)
 
@@ -104,18 +105,27 @@ class ExifTelemetryExtractor:
             image = self.Image.open(image_path)
             exif_data = image._getexif() if hasattr(image, '_getexif') else {}
             
-            if not exif_data:
-                logger.debug(f"No EXIF data in {image_path}")
+            # Extract XMP data
+            xmp_data = self._extract_xmp(image)
+            
+            if not exif_data and not xmp_data:
+                logger.debug(f"No EXIF or XMP data in {image_path}")
                 return {}
             
             # Extract GPS
             gps = self.extract_gps_from_exif(exif_data)
             
+            # Extract gimbal and drone attitude
+            gimbal = self._extract_gimbal(exif_data, xmp_data)
+            drone_attitude = self._extract_drone_attitude(exif_data, xmp_data, gimbal)
+            
             # Extract other metadata
             telemetry = {
                 'image_path': str(image_path),
                 'gps': gps,
-                'gimbal': self._extract_gimbal(exif_data),
+                'gimbal': gimbal,
+                'drone': drone_attitude,
+                'camera_heading': drone_attitude.get('camera_heading') if drone_attitude else None,
                 'drone_model': self._extract_drone_model(exif_data),
                 'timestamp': self._extract_timestamp(exif_data),
             }
@@ -126,23 +136,121 @@ class ExifTelemetryExtractor:
             logger.error(f"Failed to extract telemetry from {image_path}: {e}")
             return {}
     
-    def _extract_gimbal(self, exif_data: dict) -> Optional[Dict]:
-        """Extract gimbal angles if available in EXIF"""
-        # DJI stores gimbal info in maker notes or specific tags
-        # This is a simplified version - actual tag varies by DJI model
+    def _extract_xmp(self, image) -> Optional[str]:
+        """Extract XMP metadata from image"""
         try:
-            # Common DJI gimbal tags
-            gimbal_info = {}
-            for tag_id, value in exif_data.items():
-                tag_name = self.TAGS.get(tag_id, tag_id)
-                # Look for gimbal-related tags
-                if 'gimbal' in str(tag_name).lower():
-                    gimbal_info[tag_name] = value
-            
-            return gimbal_info if gimbal_info else None
+            xmp_data = image.getxmp()
+            return xmp_data if xmp_data else None
         except Exception as e:
-            logger.debug(f"Gimbal extraction error: {e}")
+            logger.debug(f"XMP extraction error: {e}")
             return None
+    
+    def _extract_gimbal(self, exif_data: dict, xmp_data: Optional[str] = None) -> Optional[Dict]:
+        """Extract gimbal angles from DJI XMP data or MakerNotes"""
+        gimbal_data = {}
+        
+        # First try XMP data (preferred for DJI)
+        if xmp_data:
+            try:
+                # XMP data is returned as a nested dict by PIL
+                # Navigate to the Description section
+                if 'xmpmeta' in xmp_data and 'RDF' in xmp_data['xmpmeta']:
+                    rdf = xmp_data['xmpmeta']['RDF']
+                    if 'Description' in rdf:
+                        desc = rdf['Description']
+                        
+                        # Extract gimbal angles
+                        if 'GimbalPitchDegree' in desc:
+                            gimbal_data['pitch'] = float(desc['GimbalPitchDegree'])
+                        if 'GimbalRollDegree' in desc:
+                            gimbal_data['roll'] = float(desc['GimbalRollDegree'])
+                        if 'GimbalYawDegree' in desc:
+                            gimbal_data['yaw'] = float(desc['GimbalYawDegree'])
+                        
+                        if gimbal_data:
+                            logger.debug(f"Found gimbal data in XMP: {gimbal_data}")
+                            return gimbal_data
+                    
+            except Exception as e:
+                logger.debug(f"XMP gimbal parsing error: {e}")
+        
+        # Fallback to MakerNotes parsing (legacy method)
+        try:
+            maker_notes = exif_data.get(0x927c)  # MakerNote tag
+            if not maker_notes or not isinstance(maker_notes, bytes):
+                return None
+            
+            # DJI MakerNotes parsing - look for gimbal data
+            # This is a simplified parser; DJI format can vary by model/firmware
+            
+            # Try to find gimbal angles in the binary data
+            # Common DJI gimbal data starts around offset 0x1A-0x26
+            if len(maker_notes) > 50:
+                try:
+                    # Pitch (usually 2 bytes signed int, degrees * 10)
+                    if len(maker_notes) > 26:
+                        pitch_raw = int.from_bytes(maker_notes[26:28], byteorder='little', signed=True)
+                        gimbal_data['pitch'] = pitch_raw / 10.0
+                    
+                    # Roll
+                    if len(maker_notes) > 28:
+                        roll_raw = int.from_bytes(maker_notes[28:30], byteorder='little', signed=True)
+                        gimbal_data['roll'] = roll_raw / 10.0
+                    
+                    # Yaw
+                    if len(maker_notes) > 30:
+                        yaw_raw = int.from_bytes(maker_notes[30:32], byteorder='little', signed=True)
+                        gimbal_data['yaw'] = yaw_raw / 10.0
+                    
+                except (ValueError, IndexError):
+                    pass
+            
+            # If we found any gimbal data, return it
+            return gimbal_data if gimbal_data else None
+            
+        except Exception as e:
+            logger.debug(f"DJI gimbal extraction error: {e}")
+            return None
+    
+    def _extract_drone_attitude(self, exif_data: dict, xmp_data: Optional[str], gimbal_data: Optional[Dict]) -> Optional[Dict]:
+        """Extract drone attitude (gyro) and compute camera heading"""
+        attitude = {}
+        
+        # Parse from XMP if available
+        if xmp_data:
+            try:
+                if 'xmpmeta' in xmp_data and 'RDF' in xmp_data['xmpmeta']:
+                    rdf = xmp_data['xmpmeta']['RDF']
+                    if 'Description' in rdf:
+                        desc = rdf['Description']
+                        # Drone attitude (yaw/pitch/roll)
+                        if 'FlightPitchDegree' in desc:
+                            attitude['pitch'] = float(desc['FlightPitchDegree'])
+                        if 'FlightRollDegree' in desc:
+                            attitude['roll'] = float(desc['FlightRollDegree'])
+                        if 'FlightYawDegree' in desc:
+                            attitude['yaw'] = float(desc['FlightYawDegree'])
+                        # Drone velocity
+                        if 'FlightXSpeed' in desc:
+                            attitude['speed_x'] = float(desc['FlightXSpeed'])
+                        if 'FlightYSpeed' in desc:
+                            attitude['speed_y'] = float(desc['FlightYSpeed'])
+                        if 'FlightZSpeed' in desc:
+                            attitude['speed_z'] = float(desc['FlightZSpeed'])
+                        # magnitude (m/s) if all components exist
+                        if all(k in attitude for k in ('speed_x', 'speed_y', 'speed_z')):
+                            attitude['speed'] = (attitude['speed_x']**2 + attitude['speed_y']**2 + attitude['speed_z']**2) ** 0.5
+            except Exception as e:
+                logger.debug(f"XMP attitude parsing error: {e}")
+        
+        # Compute camera heading (world-relative) if we have yaw + gimbal
+        if attitude.get('yaw') is not None:
+            drone_yaw = attitude.get('yaw', 0.0)
+            gimbal_yaw = gimbal_data.get('yaw') if isinstance(gimbal_data, dict) else None
+            camera_heading = drone_yaw + (gimbal_yaw if gimbal_yaw is not None else 0.0)
+            attitude['camera_heading'] = (camera_heading + 360) % 360
+        
+        return attitude if attitude else None
     
     @staticmethod
     def _extract_drone_model(exif_data: dict) -> Optional[str]:
