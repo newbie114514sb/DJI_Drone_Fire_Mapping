@@ -243,12 +243,13 @@ class ExifTelemetryExtractor:
             except Exception as e:
                 logger.debug(f"XMP attitude parsing error: {e}")
         
-        # Compute camera heading (world-relative) if we have yaw + gimbal
-        if attitude.get('yaw') is not None:
-            drone_yaw = attitude.get('yaw', 0.0)
-            gimbal_yaw = gimbal_data.get('yaw') if isinstance(gimbal_data, dict) else None
-            camera_heading = drone_yaw + (gimbal_yaw if gimbal_yaw is not None else 0.0)
-            attitude['camera_heading'] = (camera_heading + 360) % 360
+        # DJI GimbalYawDegree is already world-referenced heading on Mini series.
+        # Use it directly for camera azimuth and only fall back to drone yaw.
+        gimbal_yaw = gimbal_data.get('yaw') if isinstance(gimbal_data, dict) else None
+        if gimbal_yaw is not None:
+            attitude['camera_heading'] = (float(gimbal_yaw) + 360) % 360
+        elif attitude.get('yaw') is not None:
+            attitude['camera_heading'] = (float(attitude.get('yaw', 0.0)) + 360) % 360
         
         return attitude if attitude else None
     

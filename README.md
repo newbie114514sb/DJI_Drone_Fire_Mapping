@@ -21,9 +21,10 @@ This system detects wildfires from drone hyperlapse flights using post-processin
 - 📈 **Flight Reports** - Generate summary statistics
 - 🎛️ **HUD Viewer Overlay** - Show azimuth, elevation, attitude, minimap, and altitude profile in the served viewer
 - 🌐 **Timestamped Report Serving** - Generate timestamped output folders and serve the newest or a selected report
+- 🚗 **YOLOv8-Ready Vehicle Overlay** - Optionally render red detection boxes in the HUD and geolocated car markers on the map when a model is provided
 
 **Future:**
-- 🔥 Fire detection with YOLOv8 (coming next)
+- 🔥 Fire detection with YOLOv8 (custom model)
 - 🌡️ Thermal camera support (if using M300 instead)
 
 Based on research from [forest_fire_detection_system](https://github.com/lee-shun/forest_fire_detection_system).
@@ -132,9 +133,16 @@ python main.py --serve 03-15-2026_13-06
 
 # List reports and choose one interactively
 python main.py --list-reports
+
+# Optional: run a YOLOv8 model and keep only cars
+python main.py --analyze data/raw/hyperlapse_images --output data/outputs/ --detect-model path/to/model.pt
+
+# Optional: keep multiple classes and change the threshold
+python main.py --analyze data/raw/hyperlapse_images --output data/outputs/ --detect-model path/to/model.pt --detect-class car --detect-class truck --detect-confidence 0.35
 ```
 
 Generated reports are written to timestamped folders under `data/outputs/`. When the viewer changes, generate a new report rather than editing an older output folder in place.
+If `--detect-model` is provided, the report also writes `object_detections.json`, `car_detection_report.txt`, and `car_detections.geojson` when tracks can be geolocated.
 
 ## Telemetry Data
 
@@ -228,6 +236,20 @@ Once implemented, will use:
 - **Input**: Hyperlapse images or extracted frames
 - **Output**: Fire bounding boxes with confidence scores → GPS locations
 - **Training**: Custom dataset from fire/drone imagery
+
+## Vehicle Detection Overlay
+
+The analysis pipeline can now accept a placeholder YOLOv8 model for cars or other object classes.
+
+- `--detect-model`: path to a YOLOv8 `.pt` model
+- `--detect-class`: class label to keep from the model output; repeat the flag for multiple classes
+- `--detect-confidence`: minimum confidence threshold for retained detections
+
+When detection mode is enabled:
+
+- The HUD viewer draws red bounding boxes over the current frame.
+- Multi-frame tracks are triangulated when possible to estimate object latitude, longitude, and MSL altitude.
+- The minimap and saved trajectory map show red markers for geolocated detections.
 
 ## 3D Object Geolocation
 

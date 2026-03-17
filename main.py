@@ -13,17 +13,22 @@ Workflow:
 
 import logging
 from pathlib import Path
+import json
 import yaml
-from typing import Optional
+from typing import Dict, List, Optional
 import argparse
 import http.server
 import socketserver
 import os
 from datetime import datetime
 
+import cv2
+
 # Import modules from src
+from src.detection.detector import DetectionTracker, YoloObjectDetector
 from src.drone_control.flight_manager import HyperlapseFlightGuide
 from src.visualization.telemetry import TelemetrySequence
+from src.visualization.map_generator import FireGeolocation, MapGenerator
 from src.visualization.viewer import TrajectoryMapGenerator
 
 # Configure logging
@@ -68,7 +73,14 @@ class HyperlapseFireMappingSystem:
             logger.error(f"Config file not found: {config_path}")
             return {}
     
-    def analyze_hyperlapse_folder(self, hyperlapse_folder: str, output_dir: str = 'data/outputs') -> dict:
+    def analyze_hyperlapse_folder(
+        self,
+        hyperlapse_folder: str,
+        output_dir: str = 'data/outputs',
+        detection_model_path: Optional[str] = None,
+        detection_classes: Optional[List[str]] = None,
+        detection_confidence: float = 0.35,
+    ) -> dict:
         """
         Analyze a hyperlapse image folder
         
@@ -114,16 +126,33 @@ class HyperlapseFireMappingSystem:
         # Generate maps
         logger.info("Generating trajectory maps...")
         map_gen = TrajectoryMapGenerator(telem_seq)
-        map_gen.create_trajectory_map(f"{output_dir}/trajectory_map.html")
+        detection_bundle = None
+        if detection_model_path:
+            detection_bundle = self._run_object_detection(
+                telem_seq=telem_seq,
+                output_dir=output_dir,
+                model_path=detection_model_path,
+                detection_classes=detection_classes or ['car'],
+                detection_confidence=detection_confidence,
+            )
+
+        map_gen.create_trajectory_map(
+            f"{output_dir}/trajectory_map.html",
+            detection_points=detection_bundle['geolocations'] if detection_bundle else None,
+        )
         map_gen.create_altitude_profile(f"{output_dir}/altitude_profile.png")
         
         # Generate interactive video viewer
         logger.info("Generating interactive video viewer...")
         html_path = f"{output_dir}/hyperlapse_viewer.html"
-        map_gen.create_interactive_video_viewer(html_path)
+        map_gen.create_interactive_video_viewer(
+            html_path,
+            detections_by_frame=detection_bundle['frame_detections'] if detection_bundle else None,
+            map_points=detection_bundle['geolocations'] if detection_bundle else None,
+        )
         
         # Generate summary report
-        self._generate_report(telem_seq, output_dir)
+        self._generate_report(telem_seq, output_dir, detection_bundle=detection_bundle)
         
         return {
             'hyperlapse_folder': hyperlapse_folder,
@@ -131,14 +160,180 @@ class HyperlapseFireMappingSystem:
             'telemetry_count': len(telemetry),
             'bounds': bounds,
             'output_dir': output_dir,
+            'detection_count': detection_bundle['stats']['count'] if detection_bundle else 0,
+            'geolocated_detection_count': len(detection_bundle['geolocations']) if detection_bundle else 0,
         }
     
     def get_flight_instructions(self):
         """Get instructions for performing hyperlapse flights"""
         return HyperlapseFlightGuide.get_setup_instructions()
     
+    def _run_object_detection(
+        self,
+        telem_seq: TelemetrySequence,
+        output_dir: str,
+        model_path: str,
+        detection_classes: List[str],
+        detection_confidence: float,
+    ) -> Optional[Dict]:
+        logger.info(
+            "Running object detection with model %s for classes: %s",
+            model_path,
+            ', '.join(detection_classes),
+        )
+        detector = YoloObjectDetector(
+            model_path=model_path,
+            confidence_threshold=detection_confidence,
+            target_classes=detection_classes,
+        )
+        if detector.model is None:
+            logger.warning("Detection model did not load; continuing without detections")
+            return None
+
+        frame_detections: List[List[dict]] = []
+        all_detections: List[dict] = []
+        for frame_index, image_path in enumerate(telem_seq.images):
+            frame = cv2.imread(str(image_path))
+            if frame is None:
+                frame_detections.append([])
+                continue
+
+            frame_height, frame_width = frame.shape[:2]
+            raw_detections = detector.detect(frame)
+            filtered = detector.filter_detections(raw_detections, min_area_pixels=160)
+            enriched: List[dict] = []
+            for detection in filtered:
+                item = dict(detection)
+                item['frame_index'] = frame_index
+                item['frame_width'] = frame_width
+                item['frame_height'] = frame_height
+                item['image_path'] = str(image_path)
+                enriched.append(item)
+                all_detections.append(item)
+            frame_detections.append(enriched)
+
+        tracker = DetectionTracker()
+        tracks = tracker.build_tracks(frame_detections)
+
+        geolocator = FireGeolocation(self.config)
+        geolocations: List[dict] = []
+        triangulated_tracks: List[dict] = []
+        for track in tracks:
+            observations = []
+            for detection in track['detections']:
+                observation = self._build_detection_observation(telem_seq, detection)
+                if observation:
+                    observations.append(observation)
+
+            if len(observations) < 2:
+                continue
+
+            geolocation = geolocator.triangulate_observations(observations)
+            if not geolocation:
+                continue
+
+            geolocation['class'] = track['class']
+            geolocation['track_id'] = track['track_id']
+            geolocation['max_confidence'] = max(item['confidence'] for item in observations)
+            geolocation['frame_indices'] = [item['frame_index'] for item in observations]
+            geolocations.append(geolocation)
+            triangulated_tracks.append(
+                {
+                    'track_id': track['track_id'],
+                    'class': track['class'],
+                    'observation_count': len(observations),
+                    'observations': observations,
+                    'geolocation': geolocation,
+                }
+            )
+
+        payload = {
+            'model_path': model_path,
+            'target_classes': detection_classes,
+            'stats': detector.get_detection_stats(all_detections),
+            'frame_detections': frame_detections,
+            'tracks': tracks,
+            'triangulated_tracks': triangulated_tracks,
+            'geolocations': geolocations,
+        }
+
+        output_dir_path = Path(output_dir)
+        detections_json_path = output_dir_path / 'object_detections.json'
+        with open(detections_json_path, 'w', encoding='utf-8') as handle:
+            json.dump(payload, handle, indent=2)
+
+        if geolocations:
+            map_generator = MapGenerator(self.config)
+            map_generator.export_geojson(geolocations, str(output_dir_path / 'car_detections.geojson'))
+        self._generate_detection_report(output_dir_path / 'car_detection_report.txt', payload)
+
+        logger.info(
+            "Detection complete: %s frame detections, %s triangulated map points",
+            payload['stats']['count'],
+            len(geolocations),
+        )
+        return payload
+
+    def _build_detection_observation(self, telem_seq: TelemetrySequence, detection: Dict) -> Optional[Dict]:
+        telemetry = telem_seq.get_telemetry_at_index(detection['frame_index'])
+        if not telemetry:
+            return None
+        gps = telemetry.get('gps') or {}
+        if gps.get('latitude') is None or gps.get('longitude') is None or gps.get('altitude') is None:
+            return None
+
+        drone = telemetry.get('drone') or {}
+        gimbal = telemetry.get('gimbal') or {}
+        return {
+            'frame_index': detection['frame_index'],
+            'drone_lat': gps['latitude'],
+            'drone_lon': gps['longitude'],
+            'drone_altitude_m': gps['altitude'],
+            'camera_heading': telemetry.get('camera_heading'),
+            'drone_yaw': drone.get('yaw'),
+            'drone_pitch': drone.get('pitch', 0.0),
+            'gimbal_pitch': gimbal.get('pitch', 0.0),
+            'gimbal_yaw': gimbal.get('yaw', 0.0),
+            'bbox': detection['bbox'],
+            'frame_width': detection['frame_width'],
+            'frame_height': detection['frame_height'],
+            'confidence': detection['confidence'],
+            'class': detection['class'],
+            'track_id': detection.get('track_id'),
+        }
+
     @staticmethod
-    def _generate_report(telem_seq: TelemetrySequence, output_dir: str):
+    def _generate_detection_report(report_path: Path, detection_bundle: Dict):
+        with open(report_path, 'w', encoding='utf-8') as handle:
+            handle.write("OBJECT DETECTION REPORT\n")
+            handle.write("=" * 50 + "\n\n")
+            handle.write(f"Model: {detection_bundle['model_path']}\n")
+            handle.write(f"Target classes: {', '.join(detection_bundle['target_classes'])}\n")
+            handle.write(f"Frame detections: {detection_bundle['stats']['count']}\n")
+            handle.write(f"Triangulated map points: {len(detection_bundle['geolocations'])}\n\n")
+
+            if detection_bundle['stats']['classes']:
+                handle.write("Class counts:\n")
+                for class_name, count in sorted(detection_bundle['stats']['classes'].items()):
+                    handle.write(f"  {class_name}: {count}\n")
+                handle.write("\n")
+
+            if detection_bundle['geolocations']:
+                handle.write("Triangulated objects:\n")
+                handle.write("-" * 50 + "\n")
+                for item in detection_bundle['geolocations']:
+                    handle.write(
+                        f"Track {item['track_id']} ({item['class']}): "
+                        f"Lat {item['latitude']:.6f}, Lon {item['longitude']:.6f}, "
+                        f"Alt {item['altitude']:.1f}m MSL, "
+                        f"Conf {item.get('max_confidence', item.get('confidence', 0.0)):.2%}, "
+                        f"Obs {item['observation_count']}\n"
+                    )
+
+        logger.info(f"Detection report saved to {report_path}")
+
+    @staticmethod
+    def _generate_report(telem_seq: TelemetrySequence, output_dir: str, detection_bundle: Optional[Dict] = None):
         """Generate text report with flight statistics"""
         report_path = Path(output_dir) / 'flight_report.txt'
         
@@ -160,6 +355,15 @@ class HyperlapseFireMappingSystem:
                 f.write("Altitude:\n")
                 f.write(f"  Max: {bounds['max_altitude']:.1f}m\n")
                 f.write(f"  Min: {bounds['min_altitude']:.1f}m\n\n")
+
+            if detection_bundle:
+                f.write("Object Detection Summary:\n")
+                f.write(f"  Frame detections: {detection_bundle['stats']['count']}\n")
+                f.write(f"  Triangulated map points: {len(detection_bundle['geolocations'])}\n")
+                if detection_bundle['stats']['classes']:
+                    for class_name, count in sorted(detection_bundle['stats']['classes'].items()):
+                        f.write(f"  {class_name}: {count}\n")
+                f.write("\n")
             
             f.write("Sample Telemetry Points:\n")
             f.write("-" * 50 + "\n")
@@ -233,6 +437,23 @@ def main():
         action='store_true',
         help='List available reports and prompt to choose which one to serve'
     )
+    parser.add_argument(
+        '--detect-model',
+        type=str,
+        help='Optional YOLOv8 model path for object detection during analysis'
+    )
+    parser.add_argument(
+        '--detect-class',
+        dest='detect_classes',
+        action='append',
+        help='Object class to keep from the YOLO model. Repeat the flag for multiple classes. Defaults to car when --detect-model is provided.'
+    )
+    parser.add_argument(
+        '--detect-confidence',
+        type=float,
+        default=0.35,
+        help='Confidence threshold for YOLO detections (default: 0.35)'
+    )
     
     args = parser.parse_args()
 
@@ -249,12 +470,21 @@ def main():
             input_folder = 'examples/sample_hyperlapse'
         else:
             input_folder = args.analyze
-        results = system.analyze_hyperlapse_folder(input_folder, args.output)
+        results = system.analyze_hyperlapse_folder(
+            input_folder,
+            args.output,
+            detection_model_path=args.detect_model,
+            detection_classes=args.detect_classes or (['car'] if args.detect_model else None),
+            detection_confidence=args.detect_confidence,
+        )
         if results:
             print(f"\n✓ Analysis complete!")
             print(f"  Output folder: {results['output_dir']}")
             print(f"  Maps generated: {results['output_dir']}/trajectory_map.html")
             print(f"  Report: {results['output_dir']}/flight_report.txt")
+            if args.detect_model:
+                print(f"  Detected objects: {results['detection_count']}")
+                print(f"  Geolocated objects: {results['geolocated_detection_count']}")
             if args.serve:
                 # Start local web server
                 output_dir = results['output_dir']

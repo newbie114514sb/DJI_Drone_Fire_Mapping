@@ -182,7 +182,7 @@ class TrajectoryMapGenerator:
         """
         self.telemetry_sequence = telemetry_sequence
     
-    def create_trajectory_map(self, output_path: str = 'trajectory_map.html'):
+    def create_trajectory_map(self, output_path: str = 'trajectory_map.html', detection_points: Optional[List[Dict]] = None):
         """
         Create interactive map showing flight path
         Args:
@@ -202,8 +202,23 @@ class TrajectoryMapGenerator:
         m = folium.Map(
             location=[center_lat, center_lon],
             zoom_start=16,
-            tiles='OpenStreetMap'
+            tiles=None,
         )
+        folium.TileLayer(
+            tiles='https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
+            attr='Tiles &copy; Esri',
+            name='Satellite',
+            overlay=False,
+            control=True,
+            show=True,
+        ).add_to(m)
+        folium.TileLayer(
+            tiles='OpenStreetMap',
+            name='Street',
+            overlay=False,
+            control=True,
+            show=False,
+        ).add_to(m)
         
         # Draw trajectory line
         folium.PolyLine(
@@ -239,10 +254,25 @@ class TrajectoryMapGenerator:
                 fillOpacity=0.7,
             ).add_to(m)
         
-        # Add heatmap layer for density
-        heat_data = [[lat, lon] for lat, lon, _ in trajectory]
-        if len(heat_data) > 1:
-            plugins.HeatMap(heat_data, radius=20, blur=15).add_to(m)
+        if detection_points:
+            for point in detection_points:
+                popup_text = (
+                    f"{point.get('class', 'object').title()} #{point.get('track_id', '?')}<br>"
+                    f"Lat: {point['latitude']:.6f}<br>"
+                    f"Lon: {point['longitude']:.6f}<br>"
+                    f"Alt (MSL): {point.get('altitude', 0.0):.1f}m<br>"
+                    f"Method: {point.get('method', 'unknown')}<br>"
+                    f"Confidence: {point.get('max_confidence', point.get('confidence', 0.0)):.2%}"
+                )
+                folium.CircleMarker(
+                    location=[point['latitude'], point['longitude']],
+                    radius=7,
+                    popup=popup_text,
+                    color='red',
+                    fill=True,
+                    fillColor='red',
+                    fillOpacity=0.85,
+                ).add_to(m)
         
         # Add bounds box
         bounds_box = [
@@ -260,6 +290,7 @@ class TrajectoryMapGenerator:
         # Add minimap plugin
         minimap = plugins.MiniMap(toggle_display=True)
         m.add_child(minimap)
+        folium.LayerControl(collapsed=True).add_to(m)
         
         m.save(output_path)
         logger.info(f"Trajectory map saved to {output_path}")
@@ -363,7 +394,12 @@ class TrajectoryMapGenerator:
 
         return frame_paths
 
-    def create_interactive_video_viewer(self, output_path: str) -> bool:
+    def create_interactive_video_viewer(
+        self,
+        output_path: str,
+        detections_by_frame: Optional[List[List[Dict]]] = None,
+        map_points: Optional[List[Dict]] = None,
+    ) -> bool:
         """Create an interactive HTML video viewer with telemetry overlay and toggleable minimap"""
         if not self.telemetry_sequence:
             logger.error("No telemetry data available")
@@ -388,6 +424,8 @@ class TrajectoryMapGenerator:
         telemetry_json = json.dumps(self.telemetry_sequence.telemetry)
         trajectory_json = json.dumps([[lat, lon] for lat, lon, alt in trajectory])
         frame_files_json = json.dumps(frame_files)
+        detections_json = json.dumps(detections_by_frame or [])
+        map_points_json = json.dumps(map_points or [])
         report_name_json = json.dumps(out_dir.name)
         build_note_json = json.dumps("Latest build: HUD overlay refresh with restored attitude telemetry")
         video_sources_html = '\n'.join(
@@ -450,6 +488,31 @@ class TrajectoryMapGenerator:
             max-width: 100%; max-height: 100%;
             width: 100%; height: 100%; object-fit: contain;
         }
+        .detection-layer {
+            position: absolute;
+            inset: 0;
+            pointer-events: none;
+            z-index: 944;
+        }
+        .detection-box {
+            position: absolute;
+            border: 2px solid rgba(255, 64, 64, 0.95);
+            box-shadow: 0 0 16px rgba(255, 64, 64, 0.35);
+            background: rgba(255, 40, 40, 0.06);
+        }
+        .detection-label {
+            position: absolute;
+            top: -20px;
+            left: -2px;
+            padding: 2px 6px;
+            background: rgba(120, 0, 0, 0.92);
+            color: #fff;
+            font-size: 11px;
+            font-weight: 700;
+            border-radius: 4px;
+            letter-spacing: 0.03em;
+            white-space: nowrap;
+        }
         .azimuth-bar {
             position: absolute;
             top: 62px;
@@ -484,42 +547,49 @@ class TrajectoryMapGenerator:
             position: relative;
             height: 38px;
             margin: 0 14px 10px;
+            overflow: hidden;
         }
         .azimuth-line {
             position: absolute;
             left: 0;
             right: 0;
             top: 18px;
-            height: 2px;
-            background: linear-gradient(90deg, rgba(99,255,182,0) 0%, rgba(99,255,182,0.9) 12%, rgba(99,255,182,0.9) 88%, rgba(99,255,182,0) 100%);
-            box-shadow: 0 0 12px rgba(99, 255, 182, 0.32);
+            height: 1px;
+            background: linear-gradient(90deg, rgba(99,255,182,0) 0%, rgba(99,255,182,0.85) 18%, rgba(99,255,182,0.85) 82%, rgba(99,255,182,0) 100%);
         }
         .azimuth-line::before {
             content: '';
             position: absolute;
-            inset: -14px 0 -14px 0;
+            inset: -10px 0 -10px 0;
             background:
                 linear-gradient(90deg, transparent 0, transparent calc(50% - 1px), rgba(99,255,182,0.95) calc(50% - 1px), rgba(99,255,182,0.95) calc(50% + 1px), transparent calc(50% + 1px), transparent 100%),
-                repeating-linear-gradient(90deg, transparent 0 38px, rgba(99,255,182,0.6) 38px 40px, transparent 40px 78px);
-            opacity: 0.95;
+                repeating-linear-gradient(90deg, transparent 0 34px, rgba(99,255,182,0.42) 34px 35px, transparent 35px 68px);
+            opacity: 0.8;
         }
         .azimuth-ticks {
             position: absolute;
             top: -2px;
-            left: 8px;
-            right: 8px;
+            left: 50%;
             display: flex;
-            justify-content: space-between;
             align-items: center;
             font-size: 18px;
             letter-spacing: 0.08em;
             color: rgba(153, 255, 216, 0.8);
+            white-space: nowrap;
+            transform: translateX(-50%);
+            transition: transform 0.12s linear;
+            will-change: transform;
+        }
+        .azimuth-ticks span {
+            min-width: 34px;
+            text-align: center;
+            display: inline-block;
         }
         .azimuth-value {
-            font-size: 54px;
+            font-size: 46px;
             line-height: 1;
-            font-weight: 800;
-            text-shadow: 0 0 18px rgba(99, 255, 182, 0.22);
+            font-weight: 700;
+            text-shadow: 0 0 10px rgba(99, 255, 182, 0.18);
         }
         .elevation-ruler {
             position: relative;
@@ -535,9 +605,19 @@ class TrajectoryMapGenerator:
             top: 10px;
             bottom: 10px;
             right: 36px;
-            width: 2px;
-            background: linear-gradient(180deg, rgba(99,255,182,0) 0%, rgba(99,255,182,0.88) 12%, rgba(99,255,182,0.88) 88%, rgba(99,255,182,0) 100%);
-            box-shadow: 0 0 12px rgba(99, 255, 182, 0.3);
+            width: 1px;
+            background: linear-gradient(180deg, rgba(99,255,182,0) 0%, rgba(99,255,182,0.84) 15%, rgba(99,255,182,0.84) 85%, rgba(99,255,182,0) 100%);
+        }
+        .elevation-pointer {
+            position: absolute;
+            right: 25px;
+            top: 50%;
+            width: 20px;
+            height: 1px;
+            background: #63ffb6;
+            box-shadow: 0 0 7px rgba(99, 255, 182, 0.45);
+            transition: transform 0.12s linear;
+            will-change: transform;
         }
         .elevation-track::before {
             content: '';
@@ -565,10 +645,10 @@ class TrajectoryMapGenerator:
             top: 50%;
             transform: translateY(-50%);
             color: #63ffb6;
-            font-size: 34px;
-            font-weight: 800;
+            font-size: 30px;
+            font-weight: 700;
             line-height: 1;
-            text-shadow: 0 0 18px rgba(99, 255, 182, 0.22);
+            text-shadow: 0 0 10px rgba(99, 255, 182, 0.16);
         }
         .telemetry-overlay {
             position: absolute; top: 14px; left: 14px;
@@ -593,7 +673,7 @@ class TrajectoryMapGenerator:
             position: absolute;
             left: 50%; top: 50%; width: 280px; height: 160px;
             transform: translate(-50%, -50%);
-            opacity: 0.9;
+            opacity: 0.62;
         }
         .hud-ladder::before {
             content: '';
@@ -609,7 +689,7 @@ class TrajectoryMapGenerator:
             left: 50%; top: 50%; width: 250px; height: 2px;
             transform: translate(-50%, -50%);
             background: linear-gradient(90deg, rgba(0,0,0,0) 0%, #63ffb6 18%, #63ffb6 82%, rgba(0,0,0,0) 100%);
-            box-shadow: 0 0 10px rgba(99, 255, 182, 0.4);
+            box-shadow: 0 0 6px rgba(99, 255, 182, 0.28);
         }
         .hud-horizon::before,
         .hud-horizon::after {
@@ -630,33 +710,33 @@ class TrajectoryMapGenerator:
         }
         .hud-reticle {
             position: absolute;
-            left: 50%; top: 50%; width: 74px; height: 74px;
+            left: 50%; top: 50%; width: 58px; height: 58px;
             transform: translate(-50%, -50%);
             border: 1px solid rgba(99, 255, 182, 0.85);
             border-radius: 50%;
-            box-shadow: 0 0 12px rgba(99, 255, 182, 0.24);
-            background: radial-gradient(circle, rgba(99,255,182,0.14) 0%, rgba(99,255,182,0.03) 42%, rgba(0,0,0,0) 70%);
+            box-shadow: 0 0 8px rgba(99, 255, 182, 0.18);
+            background: radial-gradient(circle, rgba(99,255,182,0.08) 0%, rgba(99,255,182,0.02) 45%, rgba(0,0,0,0) 70%);
         }
         .hud-reticle::before,
         .hud-reticle::after {
             content: '';
             position: absolute;
             background: #63ffb6;
-            box-shadow: 0 0 8px rgba(99, 255, 182, 0.4);
+            box-shadow: 0 0 5px rgba(99, 255, 182, 0.25);
         }
         .hud-reticle::before {
-            left: 50%; top: -22px; width: 2px; height: 118px; transform: translateX(-50%);
+            left: 50%; top: -16px; width: 1px; height: 90px; transform: translateX(-50%);
         }
         .hud-reticle::after {
-            top: 50%; left: -22px; width: 118px; height: 2px; transform: translateY(-50%);
+            top: 50%; left: -16px; width: 90px; height: 1px; transform: translateY(-50%);
         }
         .hud-reticle-inner {
             position: absolute;
-            left: 50%; top: 50%; width: 16px; height: 16px;
+            left: 50%; top: 50%; width: 12px; height: 12px;
             transform: translate(-50%, -50%);
-            border: 2px solid rgba(99, 255, 182, 0.9);
+            border: 1px solid rgba(99, 255, 182, 0.9);
             border-radius: 50%;
-            box-shadow: 0 0 10px rgba(99, 255, 182, 0.35);
+            box-shadow: 0 0 6px rgba(99, 255, 182, 0.22);
         }
         .controls {
             background: #1a1a1a; border-top: 1px solid #333;
@@ -828,6 +908,7 @@ class TrajectoryMapGenerator:
             Your browser could not load the generated video.
         </video>
         <img id="frame-fallback" alt="Frame preview" style="display:none;" />
+        <div class="detection-layer" id="detection-layer"></div>
 
         <div class="hud-center">
             <div class="hud-ladder"></div>
@@ -840,7 +921,7 @@ class TrajectoryMapGenerator:
                 <div class="azimuth-label">Azimuth Relative To Earth</div>
                 <div class="azimuth-scale">
                     <div class="azimuth-line"></div>
-                    <div class="azimuth-ticks"><span>W</span><span>NW</span><span>N</span><span>NE</span><span>E</span></div>
+                    <div class="azimuth-ticks" id="azimuth-ticks"></div>
                 </div>
                 <div class="azimuth-value" id="earth-azimuth">--</div>
             </div>
@@ -849,6 +930,7 @@ class TrajectoryMapGenerator:
         <div class="elevation-bar">
             <div class="elevation-ruler">
                 <div class="elevation-track"></div>
+                <div class="elevation-pointer" id="elevation-pointer"></div>
                 <div class="elevation-value" id="earth-elevation">--</div>
                 <div class="elevation-label">Elevation Relative To Earth</div>
             </div>
@@ -860,7 +942,7 @@ class TrajectoryMapGenerator:
             <div class="telemetry-item"><span class="telemetry-label">GPS:</span><span class="telemetry-value" id="t-gps">--</span></div>
             <div class="telemetry-item"><span class="telemetry-label">Altitude MSL:</span><span class="telemetry-value" id="t-alt">--</span></div>
             <div class="telemetry-item"><span class="telemetry-label">Camera Heading:</span><span class="telemetry-value" id="t-heading">--</span></div>
-            <div class="telemetry-item"><span class="telemetry-label">Drone Attitude:</span><span class="telemetry-value" id="t-attitude">--</span></div>
+            <div class="telemetry-item"><span class="telemetry-label">Camera Attitude:</span><span class="telemetry-value" id="t-camera-attitude">--</span></div>
             <div class="telemetry-item"><span class="telemetry-label">Gimbal:</span><span class="telemetry-value" id="t-gimbal">--</span></div>
             <div class="telemetry-item"><span class="telemetry-label">Speed:</span><span class="telemetry-value" id="t-speed">--</span></div>
         </div>
@@ -910,6 +992,8 @@ class TrajectoryMapGenerator:
     const telemetryData = {telemetry_json};
     const trajectory   = {trajectory_json};
     const frameFiles   = {frame_files_json};
+    const detectionsByFrame = {detections_json};
+    const mapDetections = {map_points_json};
     const reportName   = {report_name_json};
     const buildNote    = {build_note_json};
     const FPS = {fps};
@@ -919,12 +1003,70 @@ class TrajectoryMapGenerator:
     const bar   = document.getElementById('seek-bar');
     let isSeeking = false;
     let map = null, mapMarker = null, mapInitialized = false;
+    let staticDetectionMarkers = [];
     let useFrameFallback = false;
     let fallbackFrame = 0;
     let fallbackPlaying = false;
     let fallbackRaf = null;
     let fallbackLastTs = 0;
     let fallbackPlaybackRate = 1;
+    let azimuthContinuousDeg = null;
+
+    function cardinalDirection(deg) {
+        const headings = ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW'];
+        const idx = Math.round((((deg % 360) + 360) % 360) / 45) % headings.length;
+        return headings[idx];
+    }
+
+    function initAzimuthTicks() {
+        const ticks = document.getElementById('azimuth-ticks');
+        if (!ticks) return;
+        ticks.innerHTML = '';
+        for (let deg = -720; deg <= 720; deg += 15) {
+            const marker = document.createElement('span');
+            marker.textContent = (deg % 45 === 0) ? cardinalDirection(deg) : '|';
+            ticks.appendChild(marker);
+        }
+    }
+
+    function unwrapAzimuth(azimuthDeg) {
+        const normalized = ((azimuthDeg % 360) + 360) % 360;
+        if (azimuthContinuousDeg == null) {
+            azimuthContinuousDeg = normalized;
+            return azimuthContinuousDeg;
+        }
+        let candidate = normalized;
+        while (candidate - azimuthContinuousDeg > 180) candidate -= 360;
+        while (candidate - azimuthContinuousDeg < -180) candidate += 360;
+        azimuthContinuousDeg = candidate;
+        return azimuthContinuousDeg;
+    }
+
+    function updateRulers(azimuthDeg, elevationDeg, hasElevation) {
+        const ticks = document.getElementById('azimuth-ticks');
+        const scale = document.querySelector('.azimuth-scale');
+        if (ticks && scale && azimuthDeg != null) {
+            const continuous = unwrapAzimuth(azimuthDeg);
+            const pxPerDeg = Math.max(2.2, scale.clientWidth / 140);
+            ticks.style.transform = `translateX(calc(-50% - ${continuous * pxPerDeg}px))`;
+        }
+
+        const pointer = document.getElementById('elevation-pointer');
+        const track = document.querySelector('.elevation-track');
+        if (pointer && track) {
+            if (!hasElevation) {
+                pointer.style.opacity = '0';
+                return;
+            }
+            pointer.style.opacity = '1';
+            const minDeg = -90;
+            const maxDeg = 30;
+            const clamped = Math.max(minDeg, Math.min(maxDeg, elevationDeg || 0));
+            const ratio = (clamped - minDeg) / (maxDeg - minDeg);
+            const offsetPx = (0.5 - ratio) * track.clientHeight;
+            pointer.style.transform = `translateY(${offsetPx}px)`;
+        }
+    }
 
     function currentDuration() {
         return useFrameFallback ? (frameFiles.length / FPS) : (vid.duration || 0);
@@ -937,6 +1079,7 @@ class TrajectoryMapGenerator:
     function syncFromFrame(frame) {
         const safeFrame = Math.max(0, Math.min(frame, telemetryData.length - 1));
         updateTelemetry(safeFrame);
+        renderDetections(safeFrame);
         updateMapMarker(safeFrame);
         document.getElementById('t-current').textContent = fmt(safeFrame / FPS);
         const duration = currentDuration();
@@ -1000,6 +1143,7 @@ class TrajectoryMapGenerator:
         if (!isSeeking) updateSeekBar();
         const frame = Math.min(Math.round(vid.currentTime * FPS), telemetryData.length - 1);
         updateTelemetry(frame);
+        renderDetections(frame);
         updateMapMarker(frame);
         document.getElementById('t-current').textContent = fmt(vid.currentTime);
     });
@@ -1008,11 +1152,13 @@ class TrajectoryMapGenerator:
         document.getElementById('t-total').textContent = fmt(vid.duration);
         document.getElementById('t-current').textContent = fmt(0);
         updateTelemetry(0);
+        renderDetections(0);
         updateSeekBar();
     });
 
     vid.addEventListener('loadeddata', () => {
         updateTelemetry(0);
+        renderDetections(0);
         updateMapMarker(0);
     });
 
@@ -1023,7 +1169,9 @@ class TrajectoryMapGenerator:
     window.addEventListener('load', () => {
         document.getElementById('report-name').textContent = reportName;
         document.getElementById('build-note').textContent = buildNote;
+        initAzimuthTicks();
         updateTelemetry(0);
+        renderDetections(0);
         document.getElementById('t-total').textContent = fmt(frameFiles.length / FPS);
         if (frameFiles.length) {
             activateFrameFallback();
@@ -1045,25 +1193,85 @@ class TrajectoryMapGenerator:
         const g = t.gps || {};
         const d = t.drone || {};
         const azimuth = t.camera_heading ?? null;
-        const elevation = ((d.pitch ?? 0) + (t.gimbal?.pitch ?? 0));
-        const hasElevation = d.pitch != null || (t.gimbal && t.gimbal.pitch != null);
+        const elevation = t.camera_pitch ?? (t.gimbal && t.gimbal.pitch != null ? t.gimbal.pitch : null);
+        const hasElevation = elevation != null;
+        const cameraRoll = t.camera_roll ?? (t.gimbal && t.gimbal.roll != null ? t.gimbal.roll : 0);
+        const cameraYaw = azimuth ?? (t.gimbal && t.gimbal.yaw != null ? t.gimbal.yaw : null);
         document.getElementById('t-frame').textContent    = idx + 1;
         document.getElementById('t-gps').textContent      = g.latitude  ? `${g.latitude.toFixed(5)}, ${g.longitude.toFixed(5)}` : '--';
         document.getElementById('t-alt').textContent      = g.altitude  ? `${g.altitude.toFixed(1)}m` : '--';
         document.getElementById('t-heading').textContent  = t.camera_heading != null ? `${t.camera_heading.toFixed(1)}\\u00b0` : '--';
-        document.getElementById('t-attitude').textContent = (d.yaw != null) ? `Y:${d.yaw.toFixed(1)}\\u00b0 P:${(d.pitch ?? 0).toFixed(1)}\\u00b0 R:${(d.roll ?? 0).toFixed(1)}\\u00b0` : '--';
+        document.getElementById('t-camera-attitude').textContent = hasElevation ? `Y:${cameraYaw != null ? cameraYaw.toFixed(1) : '--'}\\u00b0 P:${elevation.toFixed(1)}\\u00b0 R:${cameraRoll.toFixed(1)}\\u00b0` : '--';
         document.getElementById('t-gimbal').textContent   = t.gimbal ? `P:${t.gimbal.pitch||0}\\u00b0 R:${t.gimbal.roll||0}\\u00b0 Y:${t.gimbal.yaw||0}\\u00b0` : '--';
         const spd = d.speed ?? ((d.speed_x != null) ? Math.sqrt(d.speed_x**2 + d.speed_y**2 + d.speed_z**2) : null);
         document.getElementById('t-speed').textContent    = spd != null ? `${spd.toFixed(1)} m/s` : '--';
         document.getElementById('earth-azimuth').textContent = azimuth != null ? `${azimuth.toFixed(1)}\u00b0` : '--';
         document.getElementById('earth-elevation').textContent = hasElevation ? `${elevation.toFixed(1)}\u00b0` : '--';
-        updateHudAttitude(d.roll ?? 0, d.pitch ?? 0);
+        updateRulers(azimuth, elevation, hasElevation);
+        updateHudAttitude(cameraRoll, elevation ?? 0);
     }
 
     function updateHudAttitude(roll, pitch) {
         const horizon = document.getElementById('hud-horizon');
         const clampedPitch = Math.max(-20, Math.min(20, pitch || 0));
         horizon.style.transform = `translate(-50%, calc(-50% + ${clampedPitch * 3}px)) rotate(${roll || 0}deg)`;
+    }
+
+    function getVisibleMediaRect(sourceWidth, sourceHeight) {
+        const section = document.querySelector('.video-section');
+        const element = useFrameFallback ? fallbackImg : vid;
+        if (!section || !element || !sourceWidth || !sourceHeight) {
+            return null;
+        }
+
+        const sectionRect = section.getBoundingClientRect();
+        const mediaRect = element.getBoundingClientRect();
+        if (!mediaRect.width || !mediaRect.height) {
+            return null;
+        }
+
+        const sourceAspect = sourceWidth / sourceHeight;
+        let drawWidth = mediaRect.width;
+        let drawHeight = drawWidth / sourceAspect;
+        if (drawHeight > mediaRect.height) {
+            drawHeight = mediaRect.height;
+            drawWidth = drawHeight * sourceAspect;
+        }
+
+        return {
+            left: mediaRect.left - sectionRect.left + ((mediaRect.width - drawWidth) / 2),
+            top: mediaRect.top - sectionRect.top + ((mediaRect.height - drawHeight) / 2),
+            width: drawWidth,
+            height: drawHeight,
+        };
+    }
+
+    function renderDetections(frameIdx) {
+        const layer = document.getElementById('detection-layer');
+        if (!layer) return;
+        layer.innerHTML = '';
+
+        const frameDetections = detectionsByFrame[frameIdx] || [];
+        if (!frameDetections.length) return;
+
+        const frameRect = getVisibleMediaRect(frameDetections[0].frame_width, frameDetections[0].frame_height);
+        if (!frameRect) return;
+
+        for (const detection of frameDetections) {
+            const [x1, y1, x2, y2] = detection.bbox;
+            const box = document.createElement('div');
+            box.className = 'detection-box';
+            box.style.left = `${frameRect.left + (x1 / detection.frame_width) * frameRect.width}px`;
+            box.style.top = `${frameRect.top + (y1 / detection.frame_height) * frameRect.height}px`;
+            box.style.width = `${((x2 - x1) / detection.frame_width) * frameRect.width}px`;
+            box.style.height = `${((y2 - y1) / detection.frame_height) * frameRect.height}px`;
+
+            const label = document.createElement('div');
+            label.className = 'detection-label';
+            label.textContent = `${(detection.class || 'object').toUpperCase()} ${(detection.confidence * 100).toFixed(0)}%`;
+            box.appendChild(label);
+            layer.appendChild(box);
+        }
     }
 
     // ── Playback controls ─────────────────────────────────────────
@@ -1184,13 +1392,39 @@ class TrajectoryMapGenerator:
         const cLat = (Math.max(...lats) + Math.min(...lats)) / 2;
         const cLon = (Math.max(...lons) + Math.min(...lons)) / 2;
         map = L.map('minimap').setView([cLat, cLon], 16);
-        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { attribution: '\\u00a9 OSM' }).addTo(map);
+        const satelliteLayer = L.tileLayer(
+            'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
+            { attribution: 'Tiles \u00a9 Esri' }
+        );
+        const streetLayer = L.tileLayer(
+            'https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',
+            { attribution: '\u00a9 OSM' }
+        );
+        satelliteLayer.addTo(map);
+        L.control.layers(
+            {
+                'Satellite': satelliteLayer,
+                'Street': streetLayer,
+            },
+            {},
+            { collapsed: true }
+        ).addTo(map);
         L.polyline(trajectory, { color: '#00ff88', weight: 3 }).addTo(map);
         if (trajectory.length) {
             L.circleMarker(trajectory[0], { color:'green', fillColor:'green', fillOpacity:1, radius:7 }).addTo(map).bindPopup('START');
             L.circleMarker(trajectory[trajectory.length-1], { color:'red', fillColor:'red', fillOpacity:1, radius:7 }).addTo(map).bindPopup('END');
         }
         mapMarker = L.circleMarker(trajectory[0] || [cLat, cLon], { color:'red', fillColor:'red', fillOpacity:1, radius:9 }).addTo(map);
+        staticDetectionMarkers = mapDetections.map(item => {
+            const popupText = `${(item.class || 'object').toUpperCase()} #${item.track_id || '?'}<br>Lat: ${item.latitude.toFixed(6)}<br>Lon: ${item.longitude.toFixed(6)}<br>Method: ${item.method || 'unknown'}`;
+            return L.circleMarker([item.latitude, item.longitude], {
+                color: '#ff3b30',
+                fillColor: '#ff3b30',
+                fillOpacity: 0.9,
+                radius: 6,
+                weight: 2,
+            }).addTo(map).bindPopup(popupText);
+        });
         mapInitialized = true;
         updateMapMarker(Math.min(Math.round(vid.currentTime * FPS), telemetryData.length - 1));
     }
@@ -1209,6 +1443,17 @@ class TrajectoryMapGenerator:
         return `${mins}:${String(secs).padStart(2, '0')}`;
     }
 
+    window.addEventListener('resize', () => {
+        const frame = useFrameFallback ? fallbackFrame : Math.min(Math.round(vid.currentTime * FPS), telemetryData.length - 1);
+        renderDetections(frame);
+        const t = telemetryData[frame] || {};
+        const d = t.drone || {};
+        const azimuth = t.camera_heading ?? null;
+        const elevation = t.camera_pitch ?? (t.gimbal && t.gimbal.pitch != null ? t.gimbal.pitch : null);
+        const hasElevation = elevation != null;
+        updateRulers(azimuth, elevation, hasElevation);
+    });
+
 </script>
 </body>
 </html>"""
@@ -1217,6 +1462,8 @@ class TrajectoryMapGenerator:
         html_content = html_content.replace("{telemetry_json}", telemetry_json)
         html_content = html_content.replace("{trajectory_json}", trajectory_json)
         html_content = html_content.replace("{frame_files_json}", frame_files_json)
+        html_content = html_content.replace("{detections_json}", detections_json)
+        html_content = html_content.replace("{map_points_json}", map_points_json)
         html_content = html_content.replace("{fps}", str(fps))
         html_content = html_content.replace("{video_sources_html}", video_sources_html)
         html_content = html_content.replace("{report_name_json}", report_name_json)
