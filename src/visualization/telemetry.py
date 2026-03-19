@@ -14,6 +14,14 @@ logger = logging.getLogger(__name__)
 
 class ExifTelemetryExtractor:
     """Extract telemetry from image EXIF data"""
+
+    @staticmethod
+    def _heading_clockwise_from_north(angle_deg: float) -> float:
+        return (float(angle_deg) + 360.0) % 360.0
+
+    @staticmethod
+    def _heading_counterclockwise_from_north(angle_deg: float) -> float:
+        return (-float(angle_deg) + 360.0) % 360.0
     
     def __init__(self):
         """Initialize extractor"""
@@ -126,6 +134,7 @@ class ExifTelemetryExtractor:
                 'gimbal': gimbal,
                 'drone': drone_attitude,
                 'camera_heading': drone_attitude.get('camera_heading') if drone_attitude else None,
+                'camera_heading_compass': drone_attitude.get('camera_heading_compass') if drone_attitude else None,
                 'drone_model': self._extract_drone_model(exif_data),
                 'timestamp': self._extract_timestamp(exif_data),
             }
@@ -243,13 +252,16 @@ class ExifTelemetryExtractor:
             except Exception as e:
                 logger.debug(f"XMP attitude parsing error: {e}")
         
-        # DJI GimbalYawDegree is already world-referenced heading on Mini series.
-        # Use it directly for camera azimuth and only fall back to drone yaw.
+        # Preserve the compass-style heading for geometry and expose a display
+        # heading that increases North -> West -> South -> East for the HUD.
         gimbal_yaw = gimbal_data.get('yaw') if isinstance(gimbal_data, dict) else None
         if gimbal_yaw is not None:
-            attitude['camera_heading'] = (float(gimbal_yaw) + 360) % 360
+            attitude['camera_heading_compass'] = self._heading_clockwise_from_north(gimbal_yaw)
+            attitude['camera_heading'] = self._heading_counterclockwise_from_north(gimbal_yaw)
         elif attitude.get('yaw') is not None:
-            attitude['camera_heading'] = (float(attitude.get('yaw', 0.0)) + 360) % 360
+            yaw = float(attitude.get('yaw', 0.0))
+            attitude['camera_heading_compass'] = self._heading_clockwise_from_north(yaw)
+            attitude['camera_heading'] = self._heading_counterclockwise_from_north(yaw)
         
         return attitude if attitude else None
     
@@ -294,10 +306,26 @@ class TelemetrySequence:
     
     def _load_images(self):
         """Load all images from folder"""
-        self.images = sorted(
-            list(self.folder.glob('IMG_*.jpg')) + 
-            list(self.folder.glob('*.jpg'))
+        patterns = (
+            'IMG_*.jpg',
+            'IMG_*.JPG',
+            'HYPERLAPSE_*.jpg',
+            'HYPERLAPSE_*.JPG',
+            '*.jpg',
+            '*.JPG',
+            '*.jpeg',
+            '*.JPEG',
         )
+        discovered: List[Path] = []
+        seen: set[Path] = set()
+        for pattern in patterns:
+            for image_path in self.folder.glob(pattern):
+                if image_path in seen:
+                    continue
+                seen.add(image_path)
+                discovered.append(image_path)
+
+        self.images = sorted(discovered)
         logger.info(f"Loaded {len(self.images)} images from {self.folder}")
     
     def extract_telemetry(self) -> List[Dict]:

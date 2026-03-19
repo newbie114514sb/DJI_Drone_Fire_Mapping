@@ -11,6 +11,12 @@ hyperlapse:
   interval_seconds: 3         # Frame interval (2-5 recommended)
   target_resolution: "4K"     # 4096x2160
 
+camera:
+  image_width_px: 4032
+  image_height_px: 3024
+  horizontal_fov_deg: 82.1
+  vertical_fov_deg: 66.2
+
 # Not applicable - Mini 4 Pro doesn't support onboard SDK
 # flight_speed_mps: 5
 # battery_threshold: 20
@@ -31,6 +37,13 @@ visualization:
   create_trajectory_map: true
   create_altitude_profile: true
   minimap_zoom: 16
+
+geolocation:
+  bbox_anchor_x: 0.5        # 0 = left edge, 1 = right edge of detection box
+  bbox_anchor_y: 0.92       # near the bottom of vehicles so map points land on the road
+  heading_offset_deg: 0.0   # tune if map points are consistently rotated left/right
+  elevation_offset_deg: 0.0 # tune if projected points are consistently too near/far
+  roll_offset_deg: 0.0      # tune residual bank/roll calibration bias
   
 paths:
   raw_data: "data/raw"

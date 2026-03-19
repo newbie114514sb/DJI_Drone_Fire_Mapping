@@ -43,10 +43,26 @@ class HyperlapseViewer:
             telemetry_sequence: TelemetrySequence object with extracted data
         """
         self.folder = Path(image_folder)
-        self.images = sorted(
-            list(self.folder.glob('IMG_*.jpg')) + 
-            list(self.folder.glob('*.jpg'))
+        patterns = (
+            'IMG_*.jpg',
+            'IMG_*.JPG',
+            'HYPERLAPSE_*.jpg',
+            'HYPERLAPSE_*.JPG',
+            '*.jpg',
+            '*.JPG',
+            '*.jpeg',
+            '*.JPEG',
         )
+        discovered: List[Path] = []
+        seen: set[Path] = set()
+        for pattern in patterns:
+            for image_path in self.folder.glob(pattern):
+                if image_path in seen:
+                    continue
+                seen.add(image_path)
+                discovered.append(image_path)
+
+        self.images = sorted(discovered)
         self.telemetry_sequence = telemetry_sequence
         self.current_index = 0
         
@@ -181,6 +197,26 @@ class TrajectoryMapGenerator:
             telemetry_sequence: TelemetrySequence object
         """
         self.telemetry_sequence = telemetry_sequence
+
+    @staticmethod
+    def _detection_altitude_range(detection_points: Optional[List[Dict]]) -> Tuple[float, float]:
+        altitudes = [float(point.get('altitude', 0.0)) for point in (detection_points or [])]
+        if not altitudes:
+            return 0.0, 1.0
+        minimum = min(altitudes)
+        maximum = max(altitudes)
+        if abs(maximum - minimum) < 1e-6:
+            return minimum, minimum + 1.0
+        return minimum, maximum
+
+    @staticmethod
+    def _altitude_color(altitude_msl: float, altitude_min: float, altitude_max: float) -> str:
+        ratio = (float(altitude_msl) - altitude_min) / max(altitude_max - altitude_min, 1e-6)
+        ratio = max(0.0, min(1.0, ratio))
+        red = int(255 * ratio)
+        green = int(190 - (110 * ratio))
+        blue = int(255 * (1.0 - ratio))
+        return f'#{red:02x}{green:02x}{blue:02x}'
     
     def create_trajectory_map(self, output_path: str = 'trajectory_map.html', detection_points: Optional[List[Dict]] = None):
         """
@@ -255,23 +291,29 @@ class TrajectoryMapGenerator:
             ).add_to(m)
         
         if detection_points:
+            altitude_min, altitude_max = self._detection_altitude_range(detection_points)
             for point in detection_points:
+                altitude_msl = float(point.get('altitude', 0.0))
+                marker_color = self._altitude_color(altitude_msl, altitude_min, altitude_max)
                 popup_text = (
                     f"{point.get('class', 'object').title()} #{point.get('track_id', '?')}<br>"
                     f"Lat: {point['latitude']:.6f}<br>"
                     f"Lon: {point['longitude']:.6f}<br>"
-                    f"Alt (MSL): {point.get('altitude', 0.0):.1f}m<br>"
+                    f"Elevation (MSL): {altitude_msl:.1f}m<br>"
                     f"Method: {point.get('method', 'unknown')}<br>"
                     f"Confidence: {point.get('max_confidence', point.get('confidence', 0.0)):.2%}"
                 )
+                tooltip_text = f"{altitude_msl:.1f}m MSL"
                 folium.CircleMarker(
                     location=[point['latitude'], point['longitude']],
-                    radius=7,
+                    radius=4,
                     popup=popup_text,
-                    color='red',
+                    tooltip=tooltip_text,
+                    color=marker_color,
                     fill=True,
-                    fillColor='red',
-                    fillOpacity=0.85,
+                    fillColor=marker_color,
+                    fillOpacity=0.95,
+                    weight=1,
                 ).add_to(m)
         
         # Add bounds box
@@ -294,6 +336,135 @@ class TrajectoryMapGenerator:
         
         m.save(output_path)
         logger.info(f"Trajectory map saved to {output_path}")
+        return True
+
+    def create_trajectory_overview_image(
+        self,
+        output_path: str = 'trajectory_overview.png',
+        detection_points: Optional[List[Dict]] = None,
+    ):
+        """Create a static trajectory overview image in local meter coordinates."""
+        if plt is None:
+            logger.error("Matplotlib is not available for static map export")
+            return False
+
+        trajectory = self.telemetry_sequence.get_trajectory()
+        bounds = self.telemetry_sequence.get_bounds()
+        if not trajectory or not bounds:
+            logger.error("No trajectory data available")
+            return False
+
+        center_lat = (bounds['north'] + bounds['south']) / 2.0
+        center_lon = (bounds['east'] + bounds['west']) / 2.0
+        meters_per_deg_lat = 111320.0
+        meters_per_deg_lon = 111320.0 * np.cos(np.radians(center_lat))
+
+        def to_local_xy(lat: float, lon: float) -> Tuple[float, float]:
+            x_m = (float(lon) - center_lon) * meters_per_deg_lon
+            y_m = (float(lat) - center_lat) * meters_per_deg_lat
+            return x_m, y_m
+
+        trajectory_xy = np.array([to_local_xy(lat, lon) for lat, lon, _ in trajectory], dtype=float)
+
+        figure, axis = plt.subplots(figsize=(10, 8), dpi=180)
+        axis.set_facecolor('#f6f4ef')
+        figure.patch.set_facecolor('white')
+
+        axis.plot(
+            trajectory_xy[:, 0],
+            trajectory_xy[:, 1],
+            color='#2457c5',
+            linewidth=2.2,
+            alpha=0.9,
+            label='Flight path',
+            zorder=2,
+        )
+        axis.scatter(
+            trajectory_xy[1:-1, 0] if len(trajectory_xy) > 2 else trajectory_xy[:, 0],
+            trajectory_xy[1:-1, 1] if len(trajectory_xy) > 2 else trajectory_xy[:, 1],
+            s=12,
+            color='#6f90d9',
+            alpha=0.7,
+            zorder=3,
+        )
+        axis.scatter(
+            trajectory_xy[0, 0],
+            trajectory_xy[0, 1],
+            s=90,
+            color='#179b45',
+            edgecolors='white',
+            linewidths=0.9,
+            label='Start',
+            zorder=4,
+        )
+        axis.scatter(
+            trajectory_xy[-1, 0],
+            trajectory_xy[-1, 1],
+            s=90,
+            color='#d84a3a',
+            edgecolors='white',
+            linewidths=0.9,
+            label='End',
+            zorder=4,
+        )
+
+        if detection_points:
+            altitude_min, altitude_max = self._detection_altitude_range(detection_points)
+            detection_xy = np.array(
+                [to_local_xy(point['latitude'], point['longitude']) for point in detection_points],
+                dtype=float,
+            )
+            colors = [
+                self._altitude_color(float(point.get('altitude', 0.0)), altitude_min, altitude_max)
+                for point in detection_points
+            ]
+            axis.scatter(
+                detection_xy[:, 0],
+                detection_xy[:, 1],
+                s=22,
+                c=colors,
+                edgecolors='black',
+                linewidths=0.25,
+                alpha=0.95,
+                label='Mapped detections',
+                zorder=5,
+            )
+
+        span_x = max(bounds['east'] - bounds['west'], 1e-9) * meters_per_deg_lon
+        span_y = max(bounds['north'] - bounds['south'], 1e-9) * meters_per_deg_lat
+        padding_x = max(abs(span_x) * 0.08, 15.0)
+        padding_y = max(abs(span_y) * 0.08, 15.0)
+        axis.set_xlim(trajectory_xy[:, 0].min() - padding_x, trajectory_xy[:, 0].max() + padding_x)
+        axis.set_ylim(trajectory_xy[:, 1].min() - padding_y, trajectory_xy[:, 1].max() + padding_y)
+        axis.set_aspect('equal', adjustable='box')
+        axis.grid(True, linestyle='--', linewidth=0.6, color='#b8b5ac', alpha=0.6)
+        axis.set_xlabel('Easting offset (m)')
+        axis.set_ylabel('Northing offset (m)')
+        axis.set_title('Flight Trajectory Overview')
+        axis.legend(loc='best')
+
+        info_lines = [
+            f"Frames: {len(trajectory)}",
+            f"Altitude range: {bounds['min_altitude']:.1f}m to {bounds['max_altitude']:.1f}m MSL",
+        ]
+        if detection_points:
+            info_lines.append(f"Mapped detections: {len(detection_points)}")
+        axis.text(
+            0.02,
+            0.98,
+            '\n'.join(info_lines),
+            transform=axis.transAxes,
+            va='top',
+            ha='left',
+            fontsize=9,
+            bbox={'boxstyle': 'round,pad=0.35', 'facecolor': 'white', 'edgecolor': '#c8c3b8', 'alpha': 0.92},
+            zorder=6,
+        )
+
+        figure.tight_layout()
+        figure.savefig(output_path, bbox_inches='tight')
+        plt.close(figure)
+        logger.info(f"Trajectory overview image saved to {output_path}")
         return True
 
     def create_altitude_profile(self, output_path: str = 'altitude_profile.png'):
@@ -330,8 +501,55 @@ class TrajectoryMapGenerator:
         except Exception as e:
             logger.error(f"Altitude profile error: {e}")
             return False
+
+    @staticmethod
+    def _burn_detections_into_frame(
+        frame: np.ndarray,
+        detections: Optional[List[Dict]],
+        source_width: int,
+        source_height: int,
+    ) -> np.ndarray:
+        if frame is None or not detections:
+            return frame
+
+        output = frame.copy()
+        target_height, target_width = output.shape[:2]
+        scale_x = target_width / max(float(source_width), 1.0)
+        scale_y = target_height / max(float(source_height), 1.0)
+
+        for detection in detections:
+            x1, y1, x2, y2 = detection['bbox']
+            left = int(round(x1 * scale_x))
+            top = int(round(y1 * scale_y))
+            right = int(round(x2 * scale_x))
+            bottom = int(round(y2 * scale_y))
+            cv2.rectangle(output, (left, top), (right, bottom), (48, 48, 255), 2)
+
+            label = f"{str(detection.get('class', 'object')).upper()} {float(detection.get('confidence', 0.0)) * 100:.0f}%"
+            (label_width, label_height), baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+            label_top = max(0, top - label_height - baseline - 4)
+            label_bottom = label_top + label_height + baseline + 4
+            label_right = min(target_width, left + label_width + 8)
+            cv2.rectangle(output, (left, label_top), (label_right, label_bottom), (24, 24, 160), thickness=-1)
+            cv2.putText(
+                output,
+                label,
+                (left + 4, label_bottom - baseline - 2),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                (255, 255, 255),
+                1,
+                cv2.LINE_AA,
+            )
+
+        return output
     
-    def _encode_video_variants(self, out_dir: Path, fps: int = 5) -> List[Tuple[str, str]]:
+    def _encode_video_variants(
+        self,
+        out_dir: Path,
+        fps: int = 5,
+        detections_by_frame: Optional[List[List[Dict]]] = None,
+    ) -> List[Tuple[str, str]]:
         """Encode a browser-playable WebM file and return available (filename, mime_type)."""
         images = self.telemetry_sequence.images
         if not images:
@@ -356,12 +574,19 @@ class TrajectoryMapGenerator:
             writer.release()
             return []
 
-        for img_path in images:
+        for frame_index, img_path in enumerate(images):
             frame = cv2.imread(str(img_path))
             if frame is None:
                 continue
+            source_height, source_width = frame.shape[:2]
             if frame.shape[1] != w or frame.shape[0] != h:
                 frame = cv2.resize(frame, (w, h), interpolation=cv2.INTER_AREA)
+            frame = self._burn_detections_into_frame(
+                frame,
+                detections_by_frame[frame_index] if detections_by_frame and frame_index < len(detections_by_frame) else None,
+                source_width,
+                source_height,
+            )
             writer.write(frame)
         writer.release()
 
@@ -371,7 +596,12 @@ class TrajectoryMapGenerator:
 
         return []
 
-    def _prepare_preview_frames(self, out_dir: Path, max_width: int = 1280) -> List[str]:
+    def _prepare_preview_frames(
+        self,
+        out_dir: Path,
+        max_width: int = 1280,
+        detections_by_frame: Optional[List[List[Dict]]] = None,
+    ) -> List[str]:
         """Create downscaled JPG preview frames for browser-side fallback playback."""
         frames_dir = out_dir / 'frames'
         frames_dir.mkdir(parents=True, exist_ok=True)
@@ -382,10 +612,18 @@ class TrajectoryMapGenerator:
             if frame is None:
                 continue
 
-            height, width = frame.shape[:2]
+            source_height, source_width = frame.shape[:2]
+            height, width = source_height, source_width
             if width > max_width:
                 scale = max_width / float(width)
                 frame = cv2.resize(frame, (int(width * scale), int(height * scale)), interpolation=cv2.INTER_AREA)
+
+            frame = self._burn_detections_into_frame(
+                frame,
+                detections_by_frame[index] if detections_by_frame and index < len(detections_by_frame) else None,
+                source_width,
+                source_height,
+            )
 
             output_name = f"frame_{index:04d}.jpg"
             output_path = frames_dir / output_name
@@ -418,8 +656,8 @@ class TrajectoryMapGenerator:
         # Encode browser-playable video variants for smooth native playback
         fps = 5
         logger.info("Encoding image sequence to video...")
-        video_sources = self._encode_video_variants(out_dir, fps=fps)
-        frame_files = self._prepare_preview_frames(out_dir)
+        video_sources = self._encode_video_variants(out_dir, fps=fps, detections_by_frame=detections_by_frame)
+        frame_files = self._prepare_preview_frames(out_dir, detections_by_frame=detections_by_frame)
 
         telemetry_json = json.dumps(self.telemetry_sequence.telemetry)
         trajectory_json = json.dumps([[lat, lon] for lat, lon, alt in trajectory])
@@ -428,6 +666,7 @@ class TrajectoryMapGenerator:
         map_points_json = json.dumps(map_points or [])
         report_name_json = json.dumps(out_dir.name)
         build_note_json = json.dumps("Latest build: HUD overlay refresh with restored attitude telemetry")
+        video_source_count_json = json.dumps(len(video_sources))
         video_sources_html = '\n'.join(
             [f'            <source src="{filename}" type="{mime_type}">' for filename, mime_type in video_sources]
         )
@@ -512,6 +751,39 @@ class TrajectoryMapGenerator:
             border-radius: 4px;
             letter-spacing: 0.03em;
             white-space: nowrap;
+        }
+        .azimuth-bar,
+        .elevation-bar,
+        .hud-ladder,
+        .hud-horizon {
+            display: none;
+        }
+        .hud-center {
+            position: absolute;
+            left: 50%;
+            top: 50%;
+            transform: translate(-50%, -50%);
+            width: 12px;
+            height: 12px;
+            z-index: 938;
+            pointer-events: none;
+        }
+        .hud-reticle {
+            position: absolute;
+            left: 50%;
+            top: 50%;
+            width: 8px;
+            height: 8px;
+            transform: translate(-50%, -50%);
+            border: none;
+            border-radius: 50%;
+            background: #63ffb6;
+            box-shadow: 0 0 10px rgba(99, 255, 182, 0.8);
+        }
+        .hud-reticle::before,
+        .hud-reticle::after,
+        .hud-reticle-inner {
+            display: none;
         }
         .azimuth-bar {
             position: absolute;
@@ -996,6 +1268,7 @@ class TrajectoryMapGenerator:
     const mapDetections = {map_points_json};
     const reportName   = {report_name_json};
     const buildNote    = {build_note_json};
+    const videoSourceCount = {video_source_count_json};
     const FPS = {fps};
 
     const vid   = document.getElementById('main-video');
@@ -1011,9 +1284,29 @@ class TrajectoryMapGenerator:
     let fallbackLastTs = 0;
     let fallbackPlaybackRate = 1;
     let azimuthContinuousDeg = null;
+    const preloadedFallbackFrames = new Map();
+
+    function frameFromTime(seconds) {
+        return Math.max(0, Math.min(Math.floor((seconds * FPS) + 1e-6), telemetryData.length - 1));
+    }
+
+    function preloadFallbackFrame(frameIdx) {
+        if (!frameFiles.length) return;
+        const safeFrame = Math.max(0, Math.min(frameIdx, frameFiles.length - 1));
+        if (preloadedFallbackFrames.has(safeFrame)) return;
+        const img = new Image();
+        img.src = frameFiles[safeFrame];
+        preloadedFallbackFrames.set(safeFrame, img);
+    }
+
+    function preloadFallbackWindow(centerFrame) {
+        for (let offset = 0; offset <= 8; offset += 1) {
+            preloadFallbackFrame(centerFrame + offset);
+        }
+    }
 
     function cardinalDirection(deg) {
-        const headings = ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW'];
+        const headings = ['N', 'NW', 'W', 'SW', 'S', 'SE', 'E', 'NE'];
         const idx = Math.round((((deg % 360) + 360) % 360) / 45) % headings.length;
         return headings[idx];
     }
@@ -1091,7 +1384,9 @@ class TrajectoryMapGenerator:
     function showFallbackFrame(frame) {
         if (!frameFiles.length) return;
         fallbackFrame = Math.max(0, Math.min(frame, frameFiles.length - 1));
-        fallbackImg.src = frameFiles[fallbackFrame];
+        preloadFallbackWindow(fallbackFrame);
+        const cachedImage = preloadedFallbackFrames.get(fallbackFrame);
+        fallbackImg.src = cachedImage ? cachedImage.src : frameFiles[fallbackFrame];
         syncFromFrame(fallbackFrame);
     }
 
@@ -1114,13 +1409,16 @@ class TrajectoryMapGenerator:
         const step = (timestamp) => {
             if (!fallbackPlaying) return;
             if (!fallbackLastTs) fallbackLastTs = timestamp;
-            if (timestamp - fallbackLastTs >= (1000 / (FPS * fallbackPlaybackRate))) {
-                fallbackLastTs = timestamp;
+            const frameIntervalMs = 1000 / (FPS * fallbackPlaybackRate);
+            const elapsed = timestamp - fallbackLastTs;
+            if (elapsed >= frameIntervalMs) {
+                const framesToAdvance = Math.max(1, Math.floor(elapsed / frameIntervalMs));
+                fallbackLastTs += framesToAdvance * frameIntervalMs;
                 if (fallbackFrame >= frameFiles.length - 1) {
                     stopFallbackPlayback();
                     return;
                 }
-                showFallbackFrame(fallbackFrame + 1);
+                showFallbackFrame(Math.min(fallbackFrame + framesToAdvance, frameFiles.length - 1));
             }
             fallbackRaf = requestAnimationFrame(step);
         };
@@ -1141,7 +1439,7 @@ class TrajectoryMapGenerator:
     vid.addEventListener('timeupdate', () => {
         if (useFrameFallback) return;
         if (!isSeeking) updateSeekBar();
-        const frame = Math.min(Math.round(vid.currentTime * FPS), telemetryData.length - 1);
+        const frame = frameFromTime(vid.currentTime);
         updateTelemetry(frame);
         renderDetections(frame);
         updateMapMarker(frame);
@@ -1153,6 +1451,7 @@ class TrajectoryMapGenerator:
         document.getElementById('t-current').textContent = fmt(0);
         updateTelemetry(0);
         renderDetections(0);
+        updateMapMarker(0);
         updateSeekBar();
     });
 
@@ -1172,10 +1471,12 @@ class TrajectoryMapGenerator:
         initAzimuthTicks();
         updateTelemetry(0);
         renderDetections(0);
-        document.getElementById('t-total').textContent = fmt(frameFiles.length / FPS);
-        if (frameFiles.length) {
+        preloadFallbackWindow(0);
+        if (!videoSourceCount && frameFiles.length) {
+            document.getElementById('t-total').textContent = fmt(frameFiles.length / FPS);
             activateFrameFallback();
         } else {
+            document.getElementById('t-total').textContent = fmt(frameFiles.length / FPS);
             window.setTimeout(() => {
                 if (!useFrameFallback && vid.readyState < 2) {
                     activateFrameFallback();
@@ -1248,30 +1549,7 @@ class TrajectoryMapGenerator:
 
     function renderDetections(frameIdx) {
         const layer = document.getElementById('detection-layer');
-        if (!layer) return;
-        layer.innerHTML = '';
-
-        const frameDetections = detectionsByFrame[frameIdx] || [];
-        if (!frameDetections.length) return;
-
-        const frameRect = getVisibleMediaRect(frameDetections[0].frame_width, frameDetections[0].frame_height);
-        if (!frameRect) return;
-
-        for (const detection of frameDetections) {
-            const [x1, y1, x2, y2] = detection.bbox;
-            const box = document.createElement('div');
-            box.className = 'detection-box';
-            box.style.left = `${frameRect.left + (x1 / detection.frame_width) * frameRect.width}px`;
-            box.style.top = `${frameRect.top + (y1 / detection.frame_height) * frameRect.height}px`;
-            box.style.width = `${((x2 - x1) / detection.frame_width) * frameRect.width}px`;
-            box.style.height = `${((y2 - y1) / detection.frame_height) * frameRect.height}px`;
-
-            const label = document.createElement('div');
-            label.className = 'detection-label';
-            label.textContent = `${(detection.class || 'object').toUpperCase()} ${(detection.confidence * 100).toFixed(0)}%`;
-            box.appendChild(label);
-            layer.appendChild(box);
-        }
+        if (layer) layer.innerHTML = '';
     }
 
     // ── Playback controls ─────────────────────────────────────────
@@ -1294,8 +1572,9 @@ class TrajectoryMapGenerator:
         }
         vid.pause();
         vid.currentTime = Math.max(0, Math.min(vid.duration, vid.currentTime + dir / FPS));
-        const frame = Math.min(Math.round(vid.currentTime * FPS), telemetryData.length - 1);
+        const frame = frameFromTime(vid.currentTime);
         updateTelemetry(frame);
+        renderDetections(frame);
         updateMapMarker(frame);
         updateSeekBar();
         document.getElementById('t-current').textContent = fmt(vid.currentTime);
@@ -1337,8 +1616,9 @@ class TrajectoryMapGenerator:
         }
         if (vid.duration) {
             vid.currentTime = (val / 1000) * vid.duration;
-            const frame = Math.min(Math.round(vid.currentTime * FPS), telemetryData.length - 1);
+            const frame = frameFromTime(vid.currentTime);
             updateTelemetry(frame);
+            renderDetections(frame);
             updateMapMarker(frame);
             document.getElementById('t-current').textContent = fmt(vid.currentTime);
         }
@@ -1373,7 +1653,7 @@ class TrajectoryMapGenerator:
                 initMap();
             } else {
                 map.invalidateSize();
-                const frame = Math.min(Math.round(vid.currentTime * FPS), telemetryData.length - 1);
+                const frame = useFrameFallback ? fallbackFrame : frameFromTime(vid.currentTime);
                 updateMapMarker(frame);
             }
         }
@@ -1415,18 +1695,38 @@ class TrajectoryMapGenerator:
             L.circleMarker(trajectory[trajectory.length-1], { color:'red', fillColor:'red', fillOpacity:1, radius:7 }).addTo(map).bindPopup('END');
         }
         mapMarker = L.circleMarker(trajectory[0] || [cLat, cLon], { color:'red', fillColor:'red', fillOpacity:1, radius:9 }).addTo(map);
+        const detectionAltitudes = mapDetections
+            .map(item => Number(item.altitude ?? 0))
+            .filter(value => Number.isFinite(value));
+        const detectionAltitudeMin = detectionAltitudes.length ? Math.min(...detectionAltitudes) : 0;
+        const detectionAltitudeMaxRaw = detectionAltitudes.length ? Math.max(...detectionAltitudes) : 1;
+        const detectionAltitudeMax = Math.abs(detectionAltitudeMaxRaw - detectionAltitudeMin) < 1e-6
+            ? detectionAltitudeMin + 1
+            : detectionAltitudeMaxRaw;
+
+        function detectionColorForAltitude(altitude) {
+            const safeAltitude = Number.isFinite(Number(altitude)) ? Number(altitude) : detectionAltitudeMin;
+            const ratio = Math.max(0, Math.min(1, (safeAltitude - detectionAltitudeMin) / (detectionAltitudeMax - detectionAltitudeMin)));
+            const red = Math.round(255 * ratio);
+            const green = Math.round(190 - (110 * ratio));
+            const blue = Math.round(255 * (1 - ratio));
+            return `rgb(${red}, ${green}, ${blue})`;
+        }
+
         staticDetectionMarkers = mapDetections.map(item => {
-            const popupText = `${(item.class || 'object').toUpperCase()} #${item.track_id || '?'}<br>Lat: ${item.latitude.toFixed(6)}<br>Lon: ${item.longitude.toFixed(6)}<br>Method: ${item.method || 'unknown'}`;
+            const altitudeText = Number(item.altitude ?? 0).toFixed(1);
+            const markerColor = detectionColorForAltitude(item.altitude);
+            const popupText = `${(item.class || 'object').toUpperCase()} #${item.track_id || '?'}<br>Lat: ${item.latitude.toFixed(6)}<br>Lon: ${item.longitude.toFixed(6)}<br>Elevation (MSL): ${altitudeText}m<br>Method: ${item.method || 'unknown'}`;
             return L.circleMarker([item.latitude, item.longitude], {
-                color: '#ff3b30',
-                fillColor: '#ff3b30',
+                color: markerColor,
+                fillColor: markerColor,
                 fillOpacity: 0.9,
-                radius: 6,
-                weight: 2,
-            }).addTo(map).bindPopup(popupText);
+                radius: 4,
+                weight: 1,
+            }).addTo(map).bindPopup(popupText).bindTooltip(`${altitudeText}m MSL`, {direction: 'top', opacity: 0.95});
         });
         mapInitialized = true;
-        updateMapMarker(Math.min(Math.round(vid.currentTime * FPS), telemetryData.length - 1));
+        updateMapMarker(useFrameFallback ? fallbackFrame : frameFromTime(vid.currentTime));
     }
 
     function updateMapMarker(frameIdx) {
@@ -1444,7 +1744,7 @@ class TrajectoryMapGenerator:
     }
 
     window.addEventListener('resize', () => {
-        const frame = useFrameFallback ? fallbackFrame : Math.min(Math.round(vid.currentTime * FPS), telemetryData.length - 1);
+        const frame = useFrameFallback ? fallbackFrame : frameFromTime(vid.currentTime);
         renderDetections(frame);
         const t = telemetryData[frame] || {};
         const d = t.drone || {};
@@ -1466,6 +1766,7 @@ class TrajectoryMapGenerator:
         html_content = html_content.replace("{map_points_json}", map_points_json)
         html_content = html_content.replace("{fps}", str(fps))
         html_content = html_content.replace("{video_sources_html}", video_sources_html)
+        html_content = html_content.replace("{video_source_count_json}", video_source_count_json)
         html_content = html_content.replace("{report_name_json}", report_name_json)
         html_content = html_content.replace("{build_note_json}", build_note_json)
         # Write HTML file

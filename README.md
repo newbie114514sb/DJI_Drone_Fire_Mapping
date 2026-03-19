@@ -33,8 +33,35 @@ Based on research from [forest_fire_detection_system](https://github.com/lee-shu
 
 ### 1. Setup
 ```bash
+powershell -ExecutionPolicy Bypass -File .\setup.ps1
+```
+
+That one command creates `.venv`, upgrades `pip`, and installs the project dependencies.
+
+If you prefer to do it manually:
+
+```bash
+python -m venv .venv
+.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 ```
+
+The repository is intended to contain source code and configuration only. Local environments, downloaded datasets, raw flight data, and training outputs are not committed.
+
+### 1.1. Configure API Keys
+Create a local `.env` file from `.env.example` and set your Roboflow key:
+
+```bash
+copy .env.example .env
+```
+
+Then edit `.env`:
+
+```env
+ROBOFLOW_API_KEY=your-roboflow-key-here
+```
+
+The training notebook will load `.env` automatically and will prompt for the key if it is still missing.
 
 ### 2. Prepare Flight Plan
 - Go to [waypointmap.com](https://waypointmap.com)
@@ -57,6 +84,24 @@ jupyter notebook notebooks/hyperlapse_viewer.ipynb
 
 # Or analyze from command line
 python main.py --analyze data/raw/hyperlapse_images --output data/outputs/
+```
+
+### 5. Optional Local Assets
+These folders are expected to be created locally on each machine and are ignored by Git:
+
+- `.venv/`
+- `data/raw/`
+- `data/processed/`
+- `data/outputs/`
+- `notebooks/visdrone-1/`
+- `notebooks/runs/`
+- `runs/`
+
+### 6. Optional GPU Upgrade
+The default install command uses the standard PyPI packages. If the machine has an NVIDIA GPU and you want CUDA-enabled PyTorch, upgrade those two packages after setup:
+
+```bash
+.venv\Scripts\python.exe -m pip install --upgrade torch torchvision --index-url https://download.pytorch.org/whl/cu128
 ```
 
 ## Project Structure

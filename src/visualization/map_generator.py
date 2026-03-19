@@ -25,23 +25,47 @@ class FireGeolocation:
         """Initialize with config"""
         self.config = config or {}
         camera_cfg = self.config.get('camera', {})
+        geolocation_cfg = self.config.get('geolocation', {})
         self.default_horizontal_fov = float(camera_cfg.get('horizontal_fov_deg', 70.0))
         self.default_vertical_fov = float(camera_cfg.get('vertical_fov_deg', 56.0))
+        self.default_bbox_anchor_x = float(geolocation_cfg.get('bbox_anchor_x', 0.5))
+        self.default_bbox_anchor_y = float(geolocation_cfg.get('bbox_anchor_y', 0.92))
+        self.heading_offset_deg = float(geolocation_cfg.get('heading_offset_deg', 0.0))
+        self.elevation_offset_deg = float(geolocation_cfg.get('elevation_offset_deg', 0.0))
+        self.roll_offset_deg = float(geolocation_cfg.get('roll_offset_deg', 0.0))
 
     def _camera_heading(self, observation: Dict) -> Optional[float]:
-        heading = observation.get('camera_heading')
+        heading = observation.get('camera_heading_compass', observation.get('camera_heading'))
         if heading is not None:
-            return float(heading)
+            return (float(heading) + self.heading_offset_deg) % 360.0
 
         drone_yaw = observation.get('drone_yaw')
         gimbal_yaw = observation.get('gimbal_yaw', 0.0)
         if drone_yaw is None:
             return None
 
-        return (float(drone_yaw) + float(gimbal_yaw)) % 360.0
+        return (float(drone_yaw) + float(gimbal_yaw) + self.heading_offset_deg) % 360.0
 
     def _camera_elevation(self, observation: Dict) -> float:
-        return float(observation.get('drone_pitch', 0.0)) + float(observation.get('gimbal_pitch', 0.0))
+        return (
+            float(observation.get('drone_pitch', 0.0))
+            + float(observation.get('gimbal_pitch', 0.0))
+            + self.elevation_offset_deg
+        )
+
+    def _camera_roll(self, observation: Dict) -> float:
+        return (
+            float(observation.get('drone_roll', 0.0))
+            + float(observation.get('gimbal_roll', 0.0))
+            + self.roll_offset_deg
+        )
+
+    @staticmethod
+    def _normalize(vector: np.ndarray) -> np.ndarray:
+        norm = np.linalg.norm(vector)
+        if norm <= 0:
+            return vector
+        return vector / norm
 
     def _reference_origin(self, observations: List[Dict]) -> Tuple[float, float, float]:
         latitudes = [float(item['drone_lat']) for item in observations]
@@ -110,21 +134,45 @@ class FireGeolocation:
         if camera_heading is None:
             raise ValueError('Observation is missing camera_heading or drone_yaw')
 
-        center_x = (float(bbox[0]) + float(bbox[2])) / 2.0
-        center_y = (float(bbox[1]) + float(bbox[3])) / 2.0
+        bbox_anchor_x = float(observation.get('bbox_anchor_x', self.default_bbox_anchor_x))
+        bbox_anchor_y = float(observation.get('bbox_anchor_y', self.default_bbox_anchor_y))
+
+        center_x = float(bbox[0]) + (float(bbox[2]) - float(bbox[0])) * bbox_anchor_x
+        center_y = float(bbox[1]) + (float(bbox[3]) - float(bbox[1])) * bbox_anchor_y
 
         focal_x = (frame_width / 2.0) / np.tan(np.radians(horizontal_fov) / 2.0)
         focal_y = (frame_height / 2.0) / np.tan(np.radians(vertical_fov) / 2.0)
 
         image_x = (center_x - (frame_width / 2.0)) / focal_x
         image_y = ((frame_height / 2.0) - center_y) / focal_y
+        ray_camera = self._normalize(np.array([image_x, image_y, 1.0], dtype=float))
 
-        azimuth_offset = np.degrees(np.arctan2(image_x, 1.0))
-        elevation_offset = np.degrees(np.arctan2(image_y, np.sqrt(1.0 + image_x ** 2)))
+        ray_azimuth = camera_heading
+        ray_elevation = self._camera_elevation(observation)
+        ray_roll = self._camera_roll(observation)
+        forward = self._unit_vector_from_angles(ray_azimuth, ray_elevation)
 
-        ray_azimuth = camera_heading + azimuth_offset
-        ray_elevation = self._camera_elevation(observation) + elevation_offset
-        direction = self._unit_vector_from_angles(ray_azimuth, ray_elevation)
+        world_up = np.array([0.0, 0.0, 1.0], dtype=float)
+        if abs(float(np.dot(forward, world_up))) > 0.999:
+            right = np.array([1.0, 0.0, 0.0], dtype=float)
+        else:
+            right = self._normalize(np.cross(forward, world_up))
+        up = self._normalize(np.cross(right, forward))
+
+        if abs(ray_roll) > 1e-6:
+            roll_rad = np.radians(ray_roll)
+            cos_roll = np.cos(roll_rad)
+            sin_roll = np.sin(roll_rad)
+            rolled_right = (cos_roll * right) + (sin_roll * up)
+            rolled_up = (-sin_roll * right) + (cos_roll * up)
+            right = self._normalize(rolled_right)
+            up = self._normalize(rolled_up)
+
+        direction = self._normalize(
+            (ray_camera[0] * right)
+            + (ray_camera[1] * up)
+            + (ray_camera[2] * forward)
+        )
 
         altitude_msl = float(observation.get('drone_altitude_m', observation.get('drone_altitude')))
         origin = self._geodetic_to_enu(
@@ -198,10 +246,12 @@ class FireGeolocation:
                 'horizontal_fov_deg': camera_fov,
                 'vertical_fov_deg': vertical_fov or self.default_vertical_fov,
                 'gimbal_pitch': gimbal_pitch,
+                'gimbal_roll': 0.0,
                 'camera_heading': camera_heading,
                 'drone_yaw': drone_yaw,
                 'gimbal_yaw': gimbal_yaw,
                 'drone_pitch': drone_pitch,
+                'drone_roll': 0.0,
                 'confidence': detection_confidence,
             }
 
@@ -341,7 +391,7 @@ class FireGeolocation:
                     frame_height=item['frame_height'],
                     camera_fov=item.get('horizontal_fov_deg', item.get('camera_fov', self.default_horizontal_fov)),
                     gimbal_pitch=item.get('gimbal_pitch', -45),
-                    camera_heading=item.get('camera_heading'),
+                    camera_heading=item.get('camera_heading_compass', item.get('camera_heading')),
                     drone_yaw=item.get('drone_yaw'),
                     gimbal_yaw=item.get('gimbal_yaw', 0.0),
                     drone_pitch=item.get('drone_pitch', 0.0),

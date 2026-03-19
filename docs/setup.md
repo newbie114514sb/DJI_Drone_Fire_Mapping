@@ -12,20 +12,49 @@ git clone <your-repo-url>
 cd DJI_Drone_Fire_Mapping
 ```
 
-### 2. Create Virtual Environment
+### 2. One-Command Setup
 ```bash
-python -m venv venv
-
-# Windows
-venv\Scripts\activate
-
-# macOS/Linux
-source venv/bin/activate
+powershell -ExecutionPolicy Bypass -File .\setup.ps1
 ```
 
-### 3. Install Dependencies
+That command creates `.venv`, upgrades `pip`, and installs everything from `requirements.txt`.
+
+### 3. Manual Setup
+```bash
+python -m venv .venv
+
+# Windows
+.venv\Scripts\activate
+
+# macOS/Linux
+source .venv/bin/activate
+```
+
+### 4. Install Dependencies
 ```bash
 pip install -r requirements.txt
+```
+
+This repository is meant to be committed without machine-local artifacts. The virtual environment, raw data, generated outputs, downloaded training datasets, and training runs are recreated locally and ignored by Git.
+
+### 5. Configure API Keys
+For the training notebook, create a local `.env` file in the repo root and add your Roboflow key:
+
+```bash
+copy .env.example .env
+```
+
+```env
+ROBOFLOW_API_KEY=your-roboflow-key-here
+```
+
+`.env` is already ignored by Git. The notebook will load it automatically, and if the variable is still missing it will prompt you to paste the key.
+
+### 6. Optional GPU Upgrade
+If the target machine has an NVIDIA GPU and you want CUDA-enabled PyTorch, run this after setup:
+
+```bash
+.venv\Scripts\python.exe -m pip install --upgrade torch torchvision --index-url https://download.pytorch.org/whl/cu128
 ```
 
 ## Pre-Flight Setup
@@ -125,6 +154,7 @@ DJI_Drone_Fire_Mapping/
 │   └── config.yaml                   # Settings
 ├── data/
 │   ├── raw/                          # Hyperlapse folders
+│   ├── processed/                    # Derived local artifacts
 │   └── outputs/                      # Generated maps/reports
 ├── notebooks/
 │   ├── hyperlapse_viewer.ipynb       # Interactive viewer
@@ -177,6 +207,11 @@ detection:
 ```
 
 ## Troubleshooting
+
+### "Git wants to add huge files"
+- Do not commit `.venv/`, `data/`, `notebooks/visdrone-1/`, `notebooks/runs/`, or `runs/`
+- Those paths are local-only and should stay ignored
+- If they were already tracked, remove them from the index once with `git rm -r --cached <path>` and commit the removal
 
 ### "No telemetry extracted"
 - Ensure images have GPS EXIF data

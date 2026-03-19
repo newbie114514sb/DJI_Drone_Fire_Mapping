@@ -72,6 +72,23 @@ class HyperlapseFireMappingSystem:
         except FileNotFoundError:
             logger.error(f"Config file not found: {config_path}")
             return {}
+
+    @staticmethod
+    def _find_default_detection_model() -> Optional[str]:
+        """Return the most recently modified best.pt model if one exists in common training folders."""
+        search_roots = [Path('runs'), Path('notebooks') / 'runs']
+        candidates: List[Path] = []
+        for root in search_roots:
+            if not root.exists():
+                continue
+            candidates.extend(path for path in root.glob('**/weights/best.pt') if path.is_file())
+
+        if not candidates:
+            return None
+
+        latest = max(candidates, key=lambda item: item.stat().st_mtime)
+        logger.info("Using latest trained YOLO model: %s", latest)
+        return str(latest)
     
     def analyze_hyperlapse_folder(
         self,
@@ -92,6 +109,8 @@ class HyperlapseFireMappingSystem:
             analysis results dict
         """
         logger.info(f"Analyzing hyperlapse folder: {hyperlapse_folder}")
+
+        resolved_detection_model = detection_model_path or self._find_default_detection_model()
         
         # Verify folder
         folder = Path(hyperlapse_folder)
@@ -127,17 +146,21 @@ class HyperlapseFireMappingSystem:
         logger.info("Generating trajectory maps...")
         map_gen = TrajectoryMapGenerator(telem_seq)
         detection_bundle = None
-        if detection_model_path:
+        if resolved_detection_model:
             detection_bundle = self._run_object_detection(
                 telem_seq=telem_seq,
                 output_dir=output_dir,
-                model_path=detection_model_path,
-                detection_classes=detection_classes or ['car'],
+                model_path=resolved_detection_model,
+                detection_classes=detection_classes,
                 detection_confidence=detection_confidence,
             )
 
         map_gen.create_trajectory_map(
             f"{output_dir}/trajectory_map.html",
+            detection_points=detection_bundle['geolocations'] if detection_bundle else None,
+        )
+        map_gen.create_trajectory_overview_image(
+            f"{output_dir}/trajectory_overview.png",
             detection_points=detection_bundle['geolocations'] if detection_bundle else None,
         )
         map_gen.create_altitude_profile(f"{output_dir}/altitude_profile.png")
@@ -160,6 +183,7 @@ class HyperlapseFireMappingSystem:
             'telemetry_count': len(telemetry),
             'bounds': bounds,
             'output_dir': output_dir,
+            'detection_model_path': resolved_detection_model,
             'detection_count': detection_bundle['stats']['count'] if detection_bundle else 0,
             'geolocated_detection_count': len(detection_bundle['geolocations']) if detection_bundle else 0,
         }
@@ -167,19 +191,35 @@ class HyperlapseFireMappingSystem:
     def get_flight_instructions(self):
         """Get instructions for performing hyperlapse flights"""
         return HyperlapseFlightGuide.get_setup_instructions()
+
+    def _estimate_target_altitude_msl(self, telem_seq: TelemetrySequence) -> Optional[float]:
+        geolocation_cfg = self.config.get('geolocation', {})
+        configured_altitude = geolocation_cfg.get('default_target_altitude_msl')
+        if configured_altitude is not None:
+            return float(configured_altitude)
+
+        bounds = telem_seq.get_bounds()
+        if not bounds or bounds.get('min_altitude') is None:
+            return None
+
+        survey_altitude_m = float(self.config.get('drone', {}).get('survey_altitude_m', 50.0))
+        inferred_altitude = float(bounds['min_altitude']) - survey_altitude_m
+        logger.info("Using inferred target altitude plane at %.1fm MSL", inferred_altitude)
+        return inferred_altitude
     
     def _run_object_detection(
         self,
         telem_seq: TelemetrySequence,
         output_dir: str,
         model_path: str,
-        detection_classes: List[str],
+        detection_classes: Optional[List[str]],
         detection_confidence: float,
     ) -> Optional[Dict]:
+        target_label = ', '.join(detection_classes) if detection_classes else 'all classes'
         logger.info(
             "Running object detection with model %s for classes: %s",
             model_path,
-            ', '.join(detection_classes),
+            target_label,
         )
         detector = YoloObjectDetector(
             model_path=model_path,
@@ -216,6 +256,7 @@ class HyperlapseFireMappingSystem:
         tracks = tracker.build_tracks(frame_detections)
 
         geolocator = FireGeolocation(self.config)
+        target_altitude_msl = self._estimate_target_altitude_msl(telem_seq)
         geolocations: List[dict] = []
         triangulated_tracks: List[dict] = []
         for track in tracks:
@@ -225,10 +266,13 @@ class HyperlapseFireMappingSystem:
                 if observation:
                     observations.append(observation)
 
-            if len(observations) < 2:
+            if not observations:
                 continue
 
-            geolocation = geolocator.triangulate_observations(observations)
+            best_observation = max(observations, key=lambda item: float(item.get('confidence', 0.0)))
+            geolocation = None
+            if target_altitude_msl is not None:
+                geolocation = geolocator.intersect_observation_with_altitude(best_observation, target_altitude_msl)
             if not geolocation:
                 continue
 
@@ -236,20 +280,27 @@ class HyperlapseFireMappingSystem:
             geolocation['track_id'] = track['track_id']
             geolocation['max_confidence'] = max(item['confidence'] for item in observations)
             geolocation['frame_indices'] = [item['frame_index'] for item in observations]
+            geolocation['source_frame_index'] = best_observation['frame_index']
+            geolocation['target_altitude_msl'] = target_altitude_msl
             geolocations.append(geolocation)
-            triangulated_tracks.append(
-                {
-                    'track_id': track['track_id'],
-                    'class': track['class'],
-                    'observation_count': len(observations),
-                    'observations': observations,
-                    'geolocation': geolocation,
-                }
-            )
+
+            if len(observations) >= 2:
+                triangulated = geolocator.triangulate_observations(observations)
+                if triangulated:
+                    triangulated_tracks.append(
+                        {
+                            'track_id': track['track_id'],
+                            'class': track['class'],
+                            'observation_count': len(observations),
+                            'observations': observations,
+                            'geolocation': triangulated,
+                        }
+                    )
 
         payload = {
             'model_path': model_path,
-            'target_classes': detection_classes,
+            'target_classes': detection_classes or [],
+            'target_altitude_msl': target_altitude_msl,
             'stats': detector.get_detection_stats(all_detections),
             'frame_detections': frame_detections,
             'tracks': tracks,
@@ -268,7 +319,7 @@ class HyperlapseFireMappingSystem:
         self._generate_detection_report(output_dir_path / 'car_detection_report.txt', payload)
 
         logger.info(
-            "Detection complete: %s frame detections, %s triangulated map points",
+            "Detection complete: %s frame detections, %s mapped points",
             payload['stats']['count'],
             len(geolocations),
         )
@@ -290,9 +341,12 @@ class HyperlapseFireMappingSystem:
             'drone_lon': gps['longitude'],
             'drone_altitude_m': gps['altitude'],
             'camera_heading': telemetry.get('camera_heading'),
+            'camera_heading_compass': telemetry.get('drone', {}).get('camera_heading_compass') if telemetry.get('drone') else None,
             'drone_yaw': drone.get('yaw'),
             'drone_pitch': drone.get('pitch', 0.0),
+            'drone_roll': drone.get('roll', 0.0),
             'gimbal_pitch': gimbal.get('pitch', 0.0),
+            'gimbal_roll': gimbal.get('roll', 0.0),
             'gimbal_yaw': gimbal.get('yaw', 0.0),
             'bbox': detection['bbox'],
             'frame_width': detection['frame_width'],
@@ -308,9 +362,15 @@ class HyperlapseFireMappingSystem:
             handle.write("OBJECT DETECTION REPORT\n")
             handle.write("=" * 50 + "\n\n")
             handle.write(f"Model: {detection_bundle['model_path']}\n")
-            handle.write(f"Target classes: {', '.join(detection_bundle['target_classes'])}\n")
+            target_classes = detection_bundle.get('target_classes') or []
+            handle.write(
+                f"Target classes: {', '.join(target_classes) if target_classes else 'all classes'}\n"
+            )
             handle.write(f"Frame detections: {detection_bundle['stats']['count']}\n")
-            handle.write(f"Triangulated map points: {len(detection_bundle['geolocations'])}\n\n")
+            handle.write(f"Mapped points: {len(detection_bundle['geolocations'])}\n")
+            if detection_bundle.get('target_altitude_msl') is not None:
+                handle.write(f"Projection altitude plane (MSL): {float(detection_bundle['target_altitude_msl']):.1f}m\n")
+            handle.write("\n")
 
             if detection_bundle['stats']['classes']:
                 handle.write("Class counts:\n")
@@ -319,7 +379,7 @@ class HyperlapseFireMappingSystem:
                 handle.write("\n")
 
             if detection_bundle['geolocations']:
-                handle.write("Triangulated objects:\n")
+                handle.write("Mapped objects:\n")
                 handle.write("-" * 50 + "\n")
                 for item in detection_bundle['geolocations']:
                     handle.write(
@@ -359,7 +419,9 @@ class HyperlapseFireMappingSystem:
             if detection_bundle:
                 f.write("Object Detection Summary:\n")
                 f.write(f"  Frame detections: {detection_bundle['stats']['count']}\n")
-                f.write(f"  Triangulated map points: {len(detection_bundle['geolocations'])}\n")
+                f.write(f"  Mapped points: {len(detection_bundle['geolocations'])}\n")
+                if detection_bundle.get('target_altitude_msl') is not None:
+                    f.write(f"  Projection altitude plane (MSL): {float(detection_bundle['target_altitude_msl']):.1f}m\n")
                 if detection_bundle['stats']['classes']:
                     for class_name, count in sorted(detection_bundle['stats']['classes'].items()):
                         f.write(f"  {class_name}: {count}\n")
@@ -440,13 +502,13 @@ def main():
     parser.add_argument(
         '--detect-model',
         type=str,
-        help='Optional YOLOv8 model path for object detection during analysis'
+        help='Optional YOLOv8 model path for object detection during analysis. If omitted, the newest weights/best.pt under runs/ or notebooks/runs/ is used when available.'
     )
     parser.add_argument(
         '--detect-class',
         dest='detect_classes',
         action='append',
-        help='Object class to keep from the YOLO model. Repeat the flag for multiple classes. Defaults to car when --detect-model is provided.'
+        help='Object class to keep from the YOLO model. Repeat the flag for multiple classes. If omitted, all classes produced by the model are kept.'
     )
     parser.add_argument(
         '--detect-confidence',
@@ -474,15 +536,17 @@ def main():
             input_folder,
             args.output,
             detection_model_path=args.detect_model,
-            detection_classes=args.detect_classes or (['car'] if args.detect_model else None),
+            detection_classes=args.detect_classes,
             detection_confidence=args.detect_confidence,
         )
         if results:
             print(f"\n✓ Analysis complete!")
             print(f"  Output folder: {results['output_dir']}")
             print(f"  Maps generated: {results['output_dir']}/trajectory_map.html")
+            print(f"  Static map image: {results['output_dir']}/trajectory_overview.png")
             print(f"  Report: {results['output_dir']}/flight_report.txt")
-            if args.detect_model:
+            if results.get('detection_model_path'):
+                print(f"  Detection model: {results['detection_model_path']}")
                 print(f"  Detected objects: {results['detection_count']}")
                 print(f"  Geolocated objects: {results['geolocated_detection_count']}")
             if args.serve:
