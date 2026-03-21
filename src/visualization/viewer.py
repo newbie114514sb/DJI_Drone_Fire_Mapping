@@ -190,13 +190,47 @@ class HyperlapseViewer:
 class TrajectoryMapGenerator:
     """Generate maps showing drone trajectory"""
     
-    def __init__(self, telemetry_sequence):
+    def __init__(self, telemetry_sequence, config: Optional[Dict] = None):
         """
         Initialize map generator
         Args:
             telemetry_sequence: TelemetrySequence object
         """
         self.telemetry_sequence = telemetry_sequence
+        self.config = config or {}
+        visualization_config = self.config.get('visualization', {})
+        self.trajectory_offset_east_m = float(visualization_config.get('trajectory_offset_east_m', 0.0))
+        self.trajectory_offset_north_m = float(visualization_config.get('trajectory_offset_north_m', 0.0))
+
+    def _offset_latlon(self, latitude: float, longitude: float) -> Tuple[float, float]:
+        if abs(self.trajectory_offset_east_m) < 1e-9 and abs(self.trajectory_offset_north_m) < 1e-9:
+            return float(latitude), float(longitude)
+
+        meters_per_deg_lat = 111320.0
+        meters_per_deg_lon = max(111320.0 * np.cos(np.radians(float(latitude))), 1e-6)
+        adjusted_lat = float(latitude) + (self.trajectory_offset_north_m / meters_per_deg_lat)
+        adjusted_lon = float(longitude) + (self.trajectory_offset_east_m / meters_per_deg_lon)
+        return adjusted_lat, adjusted_lon
+
+    def _offset_trajectory(self, trajectory: List[Tuple[float, float, float]]) -> List[Tuple[float, float, float]]:
+        return [(*self._offset_latlon(lat, lon), alt) for lat, lon, alt in trajectory]
+
+    @staticmethod
+    def _trajectory_bounds(trajectory: List[Tuple[float, float, float]]) -> Optional[Dict[str, float]]:
+        if not trajectory:
+            return None
+
+        latitudes = [point[0] for point in trajectory]
+        longitudes = [point[1] for point in trajectory]
+        altitudes = [point[2] for point in trajectory]
+        return {
+            'north': max(latitudes),
+            'south': min(latitudes),
+            'east': max(longitudes),
+            'west': min(longitudes),
+            'max_altitude': max(altitudes),
+            'min_altitude': min(altitudes),
+        }
 
     @staticmethod
     def _detection_altitude_range(detection_points: Optional[List[Dict]]) -> Tuple[float, float]:
@@ -217,6 +251,15 @@ class TrajectoryMapGenerator:
         green = int(190 - (110 * ratio))
         blue = int(255 * (1.0 - ratio))
         return f'#{red:02x}{green:02x}{blue:02x}'
+
+    @staticmethod
+    def _detection_altitude_display(point: Dict) -> Tuple[float, str, str]:
+        if point.get('altitude_reference') == 'takeoff_relative':
+            value = float(point.get('relative_altitude_m', point.get('altitude', 0.0)))
+            return value, f'Height (relative to takeoff plane): {value:.1f}m', f'{value:.1f}m rel'
+
+        value = float(point.get('altitude', 0.0))
+        return value, f'Elevation (MSL): {value:.1f}m', f'{value:.1f}m MSL'
     
     def create_trajectory_map(self, output_path: str = 'trajectory_map.html', detection_points: Optional[List[Dict]] = None):
         """
@@ -224,8 +267,8 @@ class TrajectoryMapGenerator:
         Args:
             output_path: where to save HTML map
         """
-        trajectory = self.telemetry_sequence.get_trajectory()
-        bounds = self.telemetry_sequence.get_bounds()
+        trajectory = self._offset_trajectory(self.telemetry_sequence.get_trajectory())
+        bounds = self._trajectory_bounds(trajectory)
         
         if not trajectory or not bounds:
             logger.error("No trajectory data available")
@@ -293,17 +336,16 @@ class TrajectoryMapGenerator:
         if detection_points:
             altitude_min, altitude_max = self._detection_altitude_range(detection_points)
             for point in detection_points:
-                altitude_msl = float(point.get('altitude', 0.0))
-                marker_color = self._altitude_color(altitude_msl, altitude_min, altitude_max)
+                altitude_value, altitude_line, tooltip_text = self._detection_altitude_display(point)
+                marker_color = self._altitude_color(altitude_value, altitude_min, altitude_max)
                 popup_text = (
                     f"{point.get('class', 'object').title()} #{point.get('track_id', '?')}<br>"
                     f"Lat: {point['latitude']:.6f}<br>"
                     f"Lon: {point['longitude']:.6f}<br>"
-                    f"Elevation (MSL): {altitude_msl:.1f}m<br>"
+                    f"{altitude_line}<br>"
                     f"Method: {point.get('method', 'unknown')}<br>"
                     f"Confidence: {point.get('max_confidence', point.get('confidence', 0.0)):.2%}"
                 )
-                tooltip_text = f"{altitude_msl:.1f}m MSL"
                 folium.CircleMarker(
                     location=[point['latitude'], point['longitude']],
                     radius=4,
@@ -348,14 +390,16 @@ class TrajectoryMapGenerator:
             logger.error("Matplotlib is not available for static map export")
             return False
 
-        trajectory = self.telemetry_sequence.get_trajectory()
-        bounds = self.telemetry_sequence.get_bounds()
-        if not trajectory or not bounds:
+        raw_trajectory = self.telemetry_sequence.get_trajectory()
+        trajectory = self._offset_trajectory(raw_trajectory)
+        bounds = self._trajectory_bounds(trajectory)
+        raw_bounds = self.telemetry_sequence.get_bounds()
+        if not trajectory or not bounds or not raw_bounds:
             logger.error("No trajectory data available")
             return False
 
-        center_lat = (bounds['north'] + bounds['south']) / 2.0
-        center_lon = (bounds['east'] + bounds['west']) / 2.0
+        center_lat = (raw_bounds['north'] + raw_bounds['south']) / 2.0
+        center_lon = (raw_bounds['east'] + raw_bounds['west']) / 2.0
         meters_per_deg_lat = 111320.0
         meters_per_deg_lon = 111320.0 * np.cos(np.radians(center_lat))
 
@@ -408,12 +452,14 @@ class TrajectoryMapGenerator:
             zorder=4,
         )
 
+        plot_xy = trajectory_xy
         if detection_points:
             altitude_min, altitude_max = self._detection_altitude_range(detection_points)
             detection_xy = np.array(
                 [to_local_xy(point['latitude'], point['longitude']) for point in detection_points],
                 dtype=float,
             )
+            plot_xy = np.vstack([trajectory_xy, detection_xy])
             colors = [
                 self._altitude_color(float(point.get('altitude', 0.0)), altitude_min, altitude_max)
                 for point in detection_points
@@ -430,12 +476,12 @@ class TrajectoryMapGenerator:
                 zorder=5,
             )
 
-        span_x = max(bounds['east'] - bounds['west'], 1e-9) * meters_per_deg_lon
-        span_y = max(bounds['north'] - bounds['south'], 1e-9) * meters_per_deg_lat
+        span_x = max(float(plot_xy[:, 0].max() - plot_xy[:, 0].min()), 1e-9)
+        span_y = max(float(plot_xy[:, 1].max() - plot_xy[:, 1].min()), 1e-9)
         padding_x = max(abs(span_x) * 0.08, 15.0)
         padding_y = max(abs(span_y) * 0.08, 15.0)
-        axis.set_xlim(trajectory_xy[:, 0].min() - padding_x, trajectory_xy[:, 0].max() + padding_x)
-        axis.set_ylim(trajectory_xy[:, 1].min() - padding_y, trajectory_xy[:, 1].max() + padding_y)
+        axis.set_xlim(plot_xy[:, 0].min() - padding_x, plot_xy[:, 0].max() + padding_x)
+        axis.set_ylim(plot_xy[:, 1].min() - padding_y, plot_xy[:, 1].max() + padding_y)
         axis.set_aspect('equal', adjustable='box')
         axis.grid(True, linestyle='--', linewidth=0.6, color='#b8b5ac', alpha=0.6)
         axis.set_xlabel('Easting offset (m)')
@@ -643,8 +689,8 @@ class TrajectoryMapGenerator:
             logger.error("No telemetry data available")
             return False
         
-        trajectory = self.telemetry_sequence.get_trajectory()
-        bounds = self.telemetry_sequence.get_bounds()
+        trajectory = self._offset_trajectory(self.telemetry_sequence.get_trajectory())
+        bounds = self._trajectory_bounds(trajectory)
         
         if not trajectory:
             logger.error("No trajectory data available")
@@ -1714,16 +1760,23 @@ class TrajectoryMapGenerator:
         }
 
         staticDetectionMarkers = mapDetections.map(item => {
-            const altitudeText = Number(item.altitude ?? 0).toFixed(1);
-            const markerColor = detectionColorForAltitude(item.altitude);
-            const popupText = `${(item.class || 'object').toUpperCase()} #${item.track_id || '?'}<br>Lat: ${item.latitude.toFixed(6)}<br>Lon: ${item.longitude.toFixed(6)}<br>Elevation (MSL): ${altitudeText}m<br>Method: ${item.method || 'unknown'}`;
+            const altitudeValue = Number(item.altitude_reference === 'takeoff_relative' ? (item.relative_altitude_m ?? item.altitude ?? 0) : (item.altitude ?? 0));
+            const altitudeText = altitudeValue.toFixed(1);
+            const markerColor = detectionColorForAltitude(altitudeValue);
+            const altitudeLine = item.altitude_reference === 'takeoff_relative'
+                ? `Height (relative to takeoff plane): ${altitudeText}m`
+                : `Elevation (MSL): ${altitudeText}m`;
+            const tooltipText = item.altitude_reference === 'takeoff_relative'
+                ? `${altitudeText}m rel`
+                : `${altitudeText}m MSL`;
+            const popupText = `${(item.class || 'object').toUpperCase()} #${item.track_id || '?'}<br>Lat: ${item.latitude.toFixed(6)}<br>Lon: ${item.longitude.toFixed(6)}<br>${altitudeLine}<br>Method: ${item.method || 'unknown'}`;
             return L.circleMarker([item.latitude, item.longitude], {
                 color: markerColor,
                 fillColor: markerColor,
                 fillOpacity: 0.9,
                 radius: 4,
                 weight: 1,
-            }).addTo(map).bindPopup(popupText).bindTooltip(`${altitudeText}m MSL`, {direction: 'top', opacity: 0.95});
+            }).addTo(map).bindPopup(popupText).bindTooltip(tooltipText, {direction: 'top', opacity: 0.95});
         });
         mapInitialized = true;
         updateMapMarker(useFrameFallback ? fallbackFrame : frameFromTime(vid.currentTime));
@@ -1731,9 +1784,8 @@ class TrajectoryMapGenerator:
 
     function updateMapMarker(frameIdx) {
         if (!mapInitialized || !mapMarker) return;
-        const t = telemetryData[frameIdx] || {};
-        const g = t.gps || {};
-        if (g.latitude && g.longitude) mapMarker.setLatLng([g.latitude, g.longitude]);
+        const point = trajectory[frameIdx] || null;
+        if (point && point.length >= 2) mapMarker.setLatLng(point);
     }
 
     function fmt(s) {

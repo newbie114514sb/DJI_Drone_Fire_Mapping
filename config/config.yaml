@@ -37,6 +37,8 @@ visualization:
   create_trajectory_map: true
   create_altitude_profile: true
   minimap_zoom: 16
+  trajectory_offset_east_m: -10.0   # visualization-only path correction; west is negative
+  trajectory_offset_north_m: 0.0    # visualization-only path correction; north is positive
 
 geolocation:
   bbox_anchor_x: 0.5        # 0 = left edge, 1 = right edge of detection box

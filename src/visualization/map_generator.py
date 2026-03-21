@@ -70,6 +70,11 @@ class FireGeolocation:
     def _reference_origin(self, observations: List[Dict]) -> Tuple[float, float, float]:
         latitudes = [float(item['drone_lat']) for item in observations]
         longitudes = [float(item['drone_lon']) for item in observations]
+        relative_altitudes = [item.get('drone_relative_altitude_m') for item in observations]
+        if all(value is not None for value in relative_altitudes):
+            # Relative altitude is referenced to takeoff, so use z=0 as the ground plane.
+            return (float(np.mean(latitudes)), float(np.mean(longitudes)), 0.0)
+
         altitudes = [float(item.get('drone_altitude_m', item.get('drone_altitude'))) for item in observations]
         return (float(np.mean(latitudes)), float(np.mean(longitudes)), float(np.mean(altitudes)))
 
@@ -174,14 +179,21 @@ class FireGeolocation:
             + (ray_camera[2] * forward)
         )
 
-        altitude_msl = float(observation.get('drone_altitude_m', observation.get('drone_altitude')))
+        relative_altitude_m = observation.get('drone_relative_altitude_m')
+        if relative_altitude_m is not None:
+            altitude_msl = float(relative_altitude_m)
+            origin_ref_altitude = 0.0
+        else:
+            altitude_msl = float(observation.get('drone_altitude_m', observation.get('drone_altitude')))
+            origin_ref_altitude = ref_altitude_msl
+
         origin = self._geodetic_to_enu(
             latitude=float(observation['drone_lat']),
             longitude=float(observation['drone_lon']),
             altitude_msl=altitude_msl,
             ref_latitude=ref_latitude,
             ref_longitude=ref_longitude,
-            ref_altitude_msl=ref_altitude_msl,
+            ref_altitude_msl=origin_ref_altitude,
         )
         return origin, direction
 
@@ -295,6 +307,41 @@ class FireGeolocation:
             'altitude': altitude,
             'confidence': float(observation.get('confidence', 0.0)),
             'method': 'plane-intersection',
+            'observation_count': 1,
+        }
+
+    def intersect_observation_with_ground_plane(self, observation: Dict, ground_up_m: float = 0.0) -> Optional[Dict[str, float]]:
+        """Project a single observation ray onto a local ENU ground plane (default z=0)."""
+        ref_latitude, ref_longitude, ref_altitude_msl = self._reference_origin([observation])
+        origin, direction = self._observation_to_ray(observation, ref_latitude, ref_longitude, ref_altitude_msl)
+
+        if abs(direction[2]) < 1e-6:
+            logger.warning('Observation ray is nearly parallel to the ground plane')
+            return None
+
+        ray_scale = (float(ground_up_m) - origin[2]) / direction[2]
+        if ray_scale < 0:
+            logger.warning('Ground plane lies behind the camera ray')
+            return None
+
+        point = origin + (ray_scale * direction)
+        latitude, longitude, altitude = self._enu_to_geodetic(
+            east=point[0],
+            north=point[1],
+            up=point[2],
+            ref_latitude=ref_latitude,
+            ref_longitude=ref_longitude,
+            ref_altitude_msl=ref_altitude_msl,
+        )
+
+        return {
+            'latitude': latitude,
+            'longitude': longitude,
+            'altitude': altitude,
+            'relative_altitude_m': float(ground_up_m),
+            'altitude_reference': 'takeoff_relative',
+            'confidence': float(observation.get('confidence', 0.0)),
+            'method': 'relative-ground-plane',
             'observation_count': 1,
         }
 
@@ -438,10 +485,15 @@ class MapGenerator:
         # Add fire detections
         for i, geo in enumerate(geolocations):
             color = 'red' if geo.get('confidence', 0.5) > 0.8 else 'orange'
+            altitude_reference = geo.get('altitude_reference')
+            if altitude_reference == 'takeoff_relative':
+                altitude_line = f"Height relative to takeoff plane: {geo.get('relative_altitude_m', geo.get('altitude', 0)):.1f}m"
+            else:
+                altitude_line = f"Altitude (MSL): {geo.get('altitude', 0):.1f}m"
             popup_text = (
                 f"Fire Detection #{i+1}<br>"
                 f"Confidence: {geo.get('confidence', 0):.2%}<br>"
-                f"Altitude (MSL): {geo.get('altitude', 0):.1f}m<br>"
+                f"{altitude_line}<br>"
                 f"Method: {geo.get('method', 'unknown')}<br>"
                 f"Observations: {geo.get('observation_count', 1)}"
             )
@@ -500,10 +552,15 @@ class MapGenerator:
                 f.write("Detected Fire Locations:\n")
                 f.write("-" * 40 + "\n")
                 for i, loc in enumerate(geolocations):
+                    altitude_reference = loc.get('altitude_reference')
+                    if altitude_reference == 'takeoff_relative':
+                        altitude_text = f"Height(rel takeoff): {loc.get('relative_altitude_m', loc.get('altitude', 0)):.1f}m"
+                    else:
+                        altitude_text = f"Altitude(MSL): {loc.get('altitude', 0):.1f}m"
                     f.write(
                         f"{i+1}. Lat: {loc['latitude']:.6f}, "
                         f"Lon: {loc['longitude']:.6f}, "
-                        f"Altitude(MSL): {loc.get('altitude', 0):.1f}m, "
+                        f"{altitude_text}, "
                         f"Confidence: {loc.get('confidence', 0):.2%}, "
                         f"Method: {loc.get('method', 'unknown')}\n"
                     )

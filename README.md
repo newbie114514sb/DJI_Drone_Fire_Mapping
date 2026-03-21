@@ -1,31 +1,46 @@
 # DJI Drone Fire Mapping
 
-Science fair project: Automated wildfire detection and mapping using DJI Mini 4 Pro and Mini 5 drones with post-flight processing.
+Science fair project for post-flight DJI hyperlapse analysis, telemetry visualization, and YOLOv8-based object detection/geolocation experiments.
+
+## Final Viewer
+
+![Final hyperlapse viewer](viewer.png)
 
 ## Overview
 
-This system detects wildfires from drone hyperlapse flights using post-processing:
+This repository currently works as a post-flight analysis pipeline for DJI Mini 4 Pro hyperlapse image sets.
+
+Right now the most complete path is:
+
+- extract telemetry from DJI EXIF/XMP metadata
+- generate timestamped analysis reports with a viewer, map, and altitude profile
+- run a trained YOLOv8 model on frames
+- project detections onto the map using a camera-ray-to-ground-plane approximation
+
+The project is still called "Fire Mapping", but the current trained model and examples are vehicle-detection oriented rather than wildfire-detection oriented. Due to the lack of available datasets and models for fire hazard detection, we were unable to acheive "Fire Mapping".
 
 **Workflow:**
 1. Create flight plan with [waypointmap.com](https://waypointmap.com) or similar
 2. Load plan onto drone via DJI Fly app
-3. Start mission manually, use HYPERLAPSE mode
+3. Start mission manually, use HYPERLAPSE mode, save as JPG
 4. Hyperlapse records images with GPS/gimbal data in EXIF metadata
 5. Download images and run through analysis pipeline
 
 **Current Features:**
-- 📷 **Hyperlapse Image Viewer** - Browse images with telemetry overlay
-- 📍 **GPS Telemetry Extraction** - Parse EXIF/XMP data for position, altitude, gimbal angles, drone attitude, and camera heading
-- 🗺️ **Interactive Maps** - View flight trajectory on Folium maps
-- 📊 **Altitude Profiles** - Visualize flight elevation changes
-- 📈 **Flight Reports** - Generate summary statistics
-- 🎛️ **HUD Viewer Overlay** - Show azimuth, elevation, attitude, minimap, and altitude profile in the served viewer
-- 🌐 **Timestamped Report Serving** - Generate timestamped output folders and serve the newest or a selected report
-- 🚗 **YOLOv8-Ready Vehicle Overlay** - Optionally render red detection boxes in the HUD and geolocated car markers on the map when a model is provided
+- 📷 Hyperlapse viewer with telemetry HUD
+- 📍 DJI EXIF/XMP telemetry extraction for GPS, altitude, gimbal angles, drone attitude, and camera heading
+- 🗺️ Timestamped HTML map and static trajectory overview generation
+- 📊 Altitude profile generation
+- 🌐 Local report serving for newest or selected outputs
+- 🚗 YOLOv8 car placeholder model for object detection overlay in the viewer
 
-**Future:**
-- 🔥 Fire detection with YOLOv8 (custom model)
-- 🌡️ Thermal camera support (if using M300 instead)
+**Current Limitation:**
+- Detection geolocation is still experimental. The pipeline now projects detections by raycasting from the camera onto a relative ground plane at `z = 0` using altitude since takeoff when available, but the mapped points are not yet reliably accurate enough to trust as final road-true positions.
+
+**Planned Direction:**
+- improve camera ray geometry and calibration
+- improve road-plane / ground-plane assumptions
+- revisit fire-specific model training once mapping accuracy is acceptable
 
 Based on research from [forest_fire_detection_system](https://github.com/lee-shun/forest_fire_detection_system).
 
@@ -79,11 +94,11 @@ The training notebook will load `.env` automatically and will prompt for the key
 ```bash
 # Copy downloaded hyperlapse folder to data/raw/
 
-# View results in interactive notebook
-jupyter notebook notebooks/hyperlapse_viewer.ipynb
+# Analyze from command line
+python main.py --analyze data/raw/001_0538 --output data/outputs
 
-# Or analyze from command line
-python main.py --analyze data/raw/hyperlapse_images --output data/outputs/
+# Serve the newest generated report
+python main.py --serve-latest
 ```
 
 ### 5. Optional Local Assets
@@ -120,8 +135,9 @@ src/
     └── map_generator.py        # Folium maps, altitude profiles
 
 notebooks/
-├── hyperlapse_viewer.ipynb     # Interactive viewer & analysis
-└── fire_detection_exploration.ipynb  # Fire detection notebook (future)
+├── hyperlapse_viewer.ipynb     # Interactive viewer & analysis notebook
+├── fire_detection_exploration.ipynb  # Older exploration notebook
+└── train.ipynb                 # Roboflow + YOLOv8 training notebook
 
 config/
 └── config.yaml                 # Settings & drone parameters
@@ -136,22 +152,36 @@ data/
 
 **Core:**
 - `opencv-python` - Image processing
-- `pillow` - EXIF metadata extraction
+- `Pillow` - EXIF/XMP metadata extraction
 - `numpy` - Array operations
+- `PyYAML` - Configuration loading
+- `python-dotenv` - Local environment variable loading
+- `defusedxml` - Safer XML handling
+- `piexif` - EXIF utilities
 
 **Visualization:**
 - `matplotlib` - Charts and plots
 - `folium` - Interactive maps
+- `Leaflet` - Browser-side interactive map rendering used by Folium and the viewer minimap
+- `OpenStreetMap` / `Esri World Imagery` - Map tile providers
+- `Font Awesome` - Viewer iconography loaded from CDN
 
-**Optional (for fire detection):**
+**Data handling:**
+- `pandas` - Tabular data utilities used by the project environment
+
+**Detection / training:**
 - `ultralytics` - YOLOv8 model
-- `tensorflow` - Deep learning inference
+- `torch`, `torchvision` - YOLOv8 runtime / training backend
 
-See `requirements.txt` for versions.
+**Development / notebooks:**
+- `jupyter` - Notebook workflow
+- `pytest` - Test runner
+
+See [requirements.txt](c:/Users/41409/DJI_Drone_Fire_Mapping/requirements.txt) for Python package versions.
 
 ## Usage
 
-### Using Jupyter Notebook (Recommended)
+### Using Jupyter Notebook
 ```bash
 jupyter notebook notebooks/hyperlapse_viewer.ipynb
 ```
@@ -168,7 +198,7 @@ Then:
 python main.py --help-flight
 
 # Analyze hyperlapse folder
-python main.py --analyze data/raw/hyperlapse_images --output data/outputs/
+python main.py --analyze data/raw/001_0538 --output data/outputs
 
 # Serve the newest generated report
 python main.py --serve-latest
@@ -179,15 +209,16 @@ python main.py --serve 03-15-2026_13-06
 # List reports and choose one interactively
 python main.py --list-reports
 
-# Optional: run a YOLOv8 model and keep only cars
-python main.py --analyze data/raw/hyperlapse_images --output data/outputs/ --detect-model path/to/model.pt
+# Optional: run a specific YOLOv8 model
+python main.py --analyze data/raw/001_0538 --output data/outputs --detect-model path/to/model.pt
 
 # Optional: keep multiple classes and change the threshold
-python main.py --analyze data/raw/hyperlapse_images --output data/outputs/ --detect-model path/to/model.pt --detect-class car --detect-class truck --detect-confidence 0.35
+python main.py --analyze data/raw/001_0509 --output data/outputs --detect-model path/to/model.pt --detect-class car --detect-class truck --detect-confidence 0.35
 ```
 
 Generated reports are written to timestamped folders under `data/outputs/`. When the viewer changes, generate a new report rather than editing an older output folder in place.
-If `--detect-model` is provided, the report also writes `object_detections.json`, `car_detection_report.txt`, and `car_detections.geojson` when tracks can be geolocated.
+If a trained model is available under `runs/` or `notebooks/runs/`, the analysis command will use the newest `weights/best.pt` automatically unless `--detect-model` is provided.
+Detection-enabled runs also write `object_detections.json`, `car_detection_report.txt`, and `car_detections.geojson`.
 
 ## Telemetry Data
 
@@ -196,7 +227,7 @@ Each hyperlapse image contains metadata in EXIF/XMP:
 - **GPS**: Latitude, longitude, altitude
 - **Gimbal**: Pitch, roll, yaw angles
 - **Drone Attitude**: Pitch, roll, yaw, and speed components when present in DJI XMP
-- **Camera Heading**: Earth-relative heading derived from drone yaw and gimbal yaw
+- **Camera Heading**: Earth-relative heading derived from DJI gimbal/drone metadata
 - **Timing**: Image capture timestamp
 - **Drone**: Model, firmware version
 
@@ -243,6 +274,20 @@ The system extracts this automatically and displays:
    - Each image has GPS + gimbal data in EXIF
    - ~1 image per waypoint in survey area
 
+## Training Notebook
+
+Use [notebooks/train.ipynb](notebooks/train.ipynb) to:
+
+- load a Roboflow dataset using `ROBOFLOW_API_KEY`
+- verify PyTorch / CUDA availability
+- train a YOLOv8 model
+
+Typical workflow:
+
+1. Train on a machine with NVIDIA CUDA support.
+2. Copy the resulting `best.pt` back into this repository.
+3. Run `main.py --analyze ...` and let the pipeline auto-pick the newest weights file.
+
 ## Example Workflow
 
 ```python
@@ -274,17 +319,9 @@ map_gen.create_interactive_video_viewer('hyperlapse_viewer.html')
 - The viewer includes a HUD-style center sight, top azimuth ruler, right elevation ruler, minimap, and slide-out altitude profile.
 - The altitude shown in the telemetry/report is GPS altitude above mean sea level, not above local ground.
 
-## Fire Detection (Future)
+## Detection Overlay
 
-Once implemented, will use:
-- **Model**: YOLOv8 (real-time object detection)
-- **Input**: Hyperlapse images or extracted frames
-- **Output**: Fire bounding boxes with confidence scores → GPS locations
-- **Training**: Custom dataset from fire/drone imagery
-
-## Vehicle Detection Overlay
-
-The analysis pipeline can now accept a placeholder YOLOv8 model for cars or other object classes.
+The analysis pipeline currently supports YOLOv8 detections for vehicles or other trained classes.
 
 - `--detect-model`: path to a YOLOv8 `.pt` model
 - `--detect-class`: class label to keep from the model output; repeat the flag for multiple classes
@@ -293,56 +330,25 @@ The analysis pipeline can now accept a placeholder YOLOv8 model for cars or othe
 When detection mode is enabled:
 
 - The HUD viewer draws red bounding boxes over the current frame.
-- Multi-frame tracks are triangulated when possible to estimate object latitude, longitude, and MSL altitude.
+- The map output adds markers for projected detections.
 - The minimap and saved trajectory map show red markers for geolocated detections.
 
-## 3D Object Geolocation
+## Current Geolocation Model
 
-The repo now includes a multi-view triangulation path for future YOLOv8 detections.
+The current implementation does not use a finished 3D reconstruction model.
 
-- Single-view detections can be projected only if you provide a known target altitude plane.
-- True 3D object placement uses two or more detections of the same object from different frames.
-- Output is latitude, longitude, and altitude above sea level.
+- Each detection is converted into a camera ray.
+- That ray is intersected with a local ground plane at `z = 0`.
+- Drone altitude since takeoff is used when available; otherwise the first frame altitude is used as a reference.
+- This is useful for iteration and debugging, but not yet accurate enough for final mapping claims.
 
-Use [src/visualization/map_generator.py](src/visualization/map_generator.py) through `FireGeolocation.triangulate_observations(...)` with observations shaped like:
+Implementation lives mainly in [src/visualization/map_generator.py](src/visualization/map_generator.py) and [main.py](main.py).
 
-```python
-observations = [
-   {
-      'drone_lat': 34.145123,
-      'drone_lon': -118.029201,
-      'drone_altitude_m': 242.4,
-      'camera_heading': 91.3,
-      'drone_pitch': 0.0,
-      'gimbal_pitch': -34.6,
-      'bbox': (1180, 420, 1300, 560),
-      'frame_width': 3840,
-      'frame_height': 2160,
-      'horizontal_fov_deg': 70.0,
-      'vertical_fov_deg': 56.0,
-      'confidence': 0.93,
-   },
-   {
-      'drone_lat': 34.145044,
-      'drone_lon': -118.029015,
-      'drone_altitude_m': 242.3,
-      'camera_heading': 102.4,
-      'drone_pitch': 0.0,
-      'gimbal_pitch': -31.9,
-      'bbox': (980, 440, 1100, 575),
-      'frame_width': 3840,
-      'frame_height': 2160,
-      'horizontal_fov_deg': 70.0,
-      'vertical_fov_deg': 56.0,
-      'confidence': 0.91,
-   },
-]
+## Known Issues
 
-geolocator = FireGeolocation(config={})
-object_fix = geolocator.triangulate_observations(observations)
-```
-
-That result can be written to HTML maps or GeoJSON using `MapGenerator.export_geojson(...)`.
+- Geolocated map points are still visibly offset in some reports.
+- WebM encoding logs an OpenCV/FFMPEG VP80 warning on Windows, but the output video is still written successfully.
+- The repository name and some class names still reference "fire mapping" even though the active trained model and examples are vehicle-focused right now.
 
 ## Safety
 
@@ -360,8 +366,20 @@ That result can be written to HTML maps or GeoJSON using `MapGenerator.export_ge
 - [DJI Fly App](https://www.dji.com/downloads/djiflysafe)
 - [Waypointmap.com](https://waypointmap.com/)
 - [Lee Shun's Fire Detection System](https://github.com/lee-shun/forest_fire_detection_system)
+- [VisDrone Dataset](https://github.com/VisDrone/VisDrone-Dataset)
+- [Roboflow](https://roboflow.com/)
 - [YOLOv8 Documentation](https://docs.ultralytics.com/)
+- [OpenStreetMap](https://www.openstreetmap.org/)
+- [Esri World Imagery](https://www.esri.com/en-us/arcgis/products/arcgis-online/base-maps)
+
+## Credits
+
+- Vehicle-detection training and experimentation in this repository use the [VisDrone Dataset](https://github.com/VisDrone/VisDrone-Dataset).
+- Dataset workflow and notebook-based training setup were built around [Roboflow](https://roboflow.com/) and [Ultralytics YOLOv8](https://docs.ultralytics.com/).
+- The trajectory map and minimap use [OpenStreetMap](https://www.openstreetmap.org/) and [Esri World Imagery](https://www.esri.com/en-us/arcgis/products/arcgis-online/base-maps) tiles.
+- Early project direction and wildfire-detection research references were informed by [Lee Shun's Fire Detection System](https://github.com/lee-shun/forest_fire_detection_system).
+- Hyperlapse analysis, telemetry extraction, viewer/report tooling, and the current geolocation experiments in this repository were developed for this project.
 
 ## License
 
-TBD
+This project is licensed under the Apache License 2.0. See [LICENSE](LICENSE).

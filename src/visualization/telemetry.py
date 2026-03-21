@@ -239,6 +239,8 @@ class ExifTelemetryExtractor:
                             attitude['roll'] = float(desc['FlightRollDegree'])
                         if 'FlightYawDegree' in desc:
                             attitude['yaw'] = float(desc['FlightYawDegree'])
+                        if 'RelativeAltitude' in desc:
+                            attitude['relative_altitude_m'] = float(desc['RelativeAltitude'])
                         # Drone velocity
                         if 'FlightXSpeed' in desc:
                             attitude['speed_x'] = float(desc['FlightXSpeed'])

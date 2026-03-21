@@ -19,6 +19,7 @@ from typing import Dict, List, Optional
 import argparse
 import http.server
 import socketserver
+import socket
 import os
 from datetime import datetime
 
@@ -51,6 +52,45 @@ class NoCacheHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
         self.send_header('Pragma', 'no-cache')
         self.send_header('Expires', '0')
         super().end_headers()
+
+
+class ReusableTCPServer(socketserver.TCPServer):
+    """TCP server that can reuse a recently closed port on Windows."""
+
+    allow_reuse_address = True
+
+
+def _find_available_port(start_port: int = 8001, max_tries: int = 25) -> int:
+    """Return the first available localhost port starting from start_port."""
+    for port in range(start_port, start_port + max_tries):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                probe.bind(("", port))
+                return port
+            except OSError:
+                continue
+    raise OSError(f"No free port found in range {start_port}-{start_port + max_tries - 1}")
+
+
+def _serve_report_directory(output_dir: str):
+    """Serve a generated report directory on the first available local port."""
+    os.chdir(output_dir)
+    port = _find_available_port(8001)
+    handler = NoCacheHTTPRequestHandler
+    with ReusableTCPServer(("", port), handler) as httpd:
+        url = f"http://localhost:{port}/hyperlapse_viewer.html"
+        print(f"\nServing interactive viewer at: {url}")
+        try:
+            import webbrowser
+            webbrowser.open(url)
+        except Exception:
+            pass
+        print("Press Ctrl+C to stop the server")
+        try:
+            httpd.serve_forever()
+        except KeyboardInterrupt:
+            print("\nServer stopped.")
 
 
 class HyperlapseFireMappingSystem:
@@ -144,7 +184,7 @@ class HyperlapseFireMappingSystem:
         
         # Generate maps
         logger.info("Generating trajectory maps...")
-        map_gen = TrajectoryMapGenerator(telem_seq)
+        map_gen = TrajectoryMapGenerator(telem_seq, config=self.config)
         detection_bundle = None
         if resolved_detection_model:
             detection_bundle = self._run_object_detection(
@@ -256,7 +296,6 @@ class HyperlapseFireMappingSystem:
         tracks = tracker.build_tracks(frame_detections)
 
         geolocator = FireGeolocation(self.config)
-        target_altitude_msl = self._estimate_target_altitude_msl(telem_seq)
         geolocations: List[dict] = []
         triangulated_tracks: List[dict] = []
         for track in tracks:
@@ -270,9 +309,7 @@ class HyperlapseFireMappingSystem:
                 continue
 
             best_observation = max(observations, key=lambda item: float(item.get('confidence', 0.0)))
-            geolocation = None
-            if target_altitude_msl is not None:
-                geolocation = geolocator.intersect_observation_with_altitude(best_observation, target_altitude_msl)
+            geolocation = geolocator.intersect_observation_with_ground_plane(best_observation, ground_up_m=0.0)
             if not geolocation:
                 continue
 
@@ -281,26 +318,13 @@ class HyperlapseFireMappingSystem:
             geolocation['max_confidence'] = max(item['confidence'] for item in observations)
             geolocation['frame_indices'] = [item['frame_index'] for item in observations]
             geolocation['source_frame_index'] = best_observation['frame_index']
-            geolocation['target_altitude_msl'] = target_altitude_msl
+            geolocation['target_plane_up_m'] = 0.0
             geolocations.append(geolocation)
-
-            if len(observations) >= 2:
-                triangulated = geolocator.triangulate_observations(observations)
-                if triangulated:
-                    triangulated_tracks.append(
-                        {
-                            'track_id': track['track_id'],
-                            'class': track['class'],
-                            'observation_count': len(observations),
-                            'observations': observations,
-                            'geolocation': triangulated,
-                        }
-                    )
 
         payload = {
             'model_path': model_path,
             'target_classes': detection_classes or [],
-            'target_altitude_msl': target_altitude_msl,
+            'projection_mode': 'relative_ground_plane',
             'stats': detector.get_detection_stats(all_detections),
             'frame_detections': frame_detections,
             'tracks': tracks,
@@ -335,11 +359,24 @@ class HyperlapseFireMappingSystem:
 
         drone = telemetry.get('drone') or {}
         gimbal = telemetry.get('gimbal') or {}
+
+        relative_altitude_m = drone.get('relative_altitude_m')
+        if relative_altitude_m is None:
+            reference_altitude_m = None
+            for item in telem_seq.telemetry:
+                gps_item = (item or {}).get('gps') or {}
+                if gps_item.get('altitude') is not None:
+                    reference_altitude_m = float(gps_item['altitude'])
+                    break
+            if reference_altitude_m is not None:
+                relative_altitude_m = float(gps['altitude']) - reference_altitude_m
+
         return {
             'frame_index': detection['frame_index'],
             'drone_lat': gps['latitude'],
             'drone_lon': gps['longitude'],
             'drone_altitude_m': gps['altitude'],
+            'drone_relative_altitude_m': relative_altitude_m,
             'camera_heading': telemetry.get('camera_heading'),
             'camera_heading_compass': telemetry.get('drone', {}).get('camera_heading_compass') if telemetry.get('drone') else None,
             'drone_yaw': drone.get('yaw'),
@@ -368,8 +405,8 @@ class HyperlapseFireMappingSystem:
             )
             handle.write(f"Frame detections: {detection_bundle['stats']['count']}\n")
             handle.write(f"Mapped points: {len(detection_bundle['geolocations'])}\n")
-            if detection_bundle.get('target_altitude_msl') is not None:
-                handle.write(f"Projection altitude plane (MSL): {float(detection_bundle['target_altitude_msl']):.1f}m\n")
+            if detection_bundle.get('projection_mode') == 'relative_ground_plane':
+                handle.write("Projection plane: z=0 relative to takeoff altitude\n")
             handle.write("\n")
 
             if detection_bundle['stats']['classes']:
@@ -382,10 +419,14 @@ class HyperlapseFireMappingSystem:
                 handle.write("Mapped objects:\n")
                 handle.write("-" * 50 + "\n")
                 for item in detection_bundle['geolocations']:
+                    if item.get('altitude_reference') == 'takeoff_relative':
+                        altitude_text = f"Height(rel takeoff) {item.get('relative_altitude_m', item.get('altitude', 0.0)):.1f}m"
+                    else:
+                        altitude_text = f"Alt {item['altitude']:.1f}m MSL"
                     handle.write(
                         f"Track {item['track_id']} ({item['class']}): "
                         f"Lat {item['latitude']:.6f}, Lon {item['longitude']:.6f}, "
-                        f"Alt {item['altitude']:.1f}m MSL, "
+                        f"{altitude_text}, "
                         f"Conf {item.get('max_confidence', item.get('confidence', 0.0)):.2%}, "
                         f"Obs {item['observation_count']}\n"
                     )
@@ -420,8 +461,8 @@ class HyperlapseFireMappingSystem:
                 f.write("Object Detection Summary:\n")
                 f.write(f"  Frame detections: {detection_bundle['stats']['count']}\n")
                 f.write(f"  Mapped points: {len(detection_bundle['geolocations'])}\n")
-                if detection_bundle.get('target_altitude_msl') is not None:
-                    f.write(f"  Projection altitude plane (MSL): {float(detection_bundle['target_altitude_msl']):.1f}m\n")
+                if detection_bundle.get('projection_mode') == 'relative_ground_plane':
+                    f.write("  Projection plane: z=0 relative to takeoff altitude\n")
                 if detection_bundle['stats']['classes']:
                     for class_name, count in sorted(detection_bundle['stats']['classes'].items()):
                         f.write(f"  {class_name}: {count}\n")
@@ -550,24 +591,7 @@ def main():
                 print(f"  Detected objects: {results['detection_count']}")
                 print(f"  Geolocated objects: {results['geolocated_detection_count']}")
             if args.serve:
-                # Start local web server
-                output_dir = results['output_dir']
-                os.chdir(output_dir)
-                port = 8001
-                handler = NoCacheHTTPRequestHandler
-                with socketserver.TCPServer(("", port), handler) as httpd:
-                    url = f"http://localhost:{port}/hyperlapse_viewer.html"
-                    print(f"\nServing interactive viewer at: {url}")
-                    try:
-                        import webbrowser
-                        webbrowser.open(url)
-                    except Exception:
-                        pass
-                    print("Press Ctrl+C to stop the server")
-                    try:
-                        httpd.serve_forever()
-                    except KeyboardInterrupt:
-                        print("\nServer stopped.")
+                _serve_report_directory(results['output_dir'])
     
     elif args.serve is not None or args.list_reports:
         # Find available output directories or files
@@ -617,22 +641,7 @@ def main():
                 return
         if selected_dir:
             print(f"Serving report: {selected_dir.name}")
-            os.chdir(selected_dir)
-            port = 8001
-            handler = NoCacheHTTPRequestHandler
-            with socketserver.TCPServer(("", port), handler) as httpd:
-                url = f"http://localhost:{port}/hyperlapse_viewer.html"
-                print(f"\nServing interactive viewer at: {url}")
-                try:
-                    import webbrowser
-                    webbrowser.open(url)
-                except Exception:
-                    pass
-                print("Press Ctrl+C to stop the server")
-                try:
-                    httpd.serve_forever()
-                except KeyboardInterrupt:
-                    print("\nServer stopped.")
+            _serve_report_directory(str(selected_dir))
     
     else:
         parser.print_help()
